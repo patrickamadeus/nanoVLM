@@ -59,7 +59,35 @@ class VisionLanguageModel(nn.Module):
                 return torch.cat(images, dim=0).to(device)
         return images # Already a tensor
 
-    def forward(self, input_ids, images, attention_mask=None, targets=None):
+    # def forward(self, input_ids, images, attention_mask=None, targets=None):
+    #     images_tensor = self._process_images(images, input_ids.device)
+    #     token_embd = self.decoder.token_embedding(input_ids) # [B, T_sequence, D_lm]
+
+    #     if images_tensor is not None:
+    #         image_embd = self.vision_encoder(images_tensor)
+    #         image_embd = self.MP(image_embd)  # [num_images, mp_image_token_length, D_lm]
+    #         token_embd = self._replace_img_tokens_with_embd(input_ids, token_embd, image_embd)
+
+    #     logits, _ = self.decoder(token_embd, attention_mask=attention_mask)
+
+    #     loss = None
+    #     if targets is not None:
+    #         logits = self.decoder.head(logits) # Apply LM head
+    #         # Loss is calculated over all tokens, but `targets` (labels) will have -100 for non-answer tokens.
+    #         # No need to slice logits based on image embedding size here, as the target mask handles it.
+    #         loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1), ignore_index=-100)
+
+    #     return logits, loss
+
+    def forward(
+        self, 
+        input_ids, 
+        images, 
+        attention_mask=None, 
+        targets=None,
+        loss_reduction: str = "mean",
+        return_loss_count: bool = False,
+    ):
         images_tensor = self._process_images(images, input_ids.device)
         token_embd = self.decoder.token_embedding(input_ids) # [B, T_sequence, D_lm]
 
@@ -71,11 +99,25 @@ class VisionLanguageModel(nn.Module):
         logits, _ = self.decoder(token_embd, attention_mask=attention_mask)
 
         loss = None
+        loss_count = None
         if targets is not None:
             logits = self.decoder.head(logits) # Apply LM head
             # Loss is calculated over all tokens, but `targets` (labels) will have -100 for non-answer tokens.
             # No need to slice logits based on image embedding size here, as the target mask handles it.
-            loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1), ignore_index=-100)
+            loss = F.cross_entropy(
+                logits.reshape(-1, logits.size(-1)),
+                targets.reshape(-1), 
+                ignore_index=-100,
+                reduction=loss_reduction
+            )
+            if return_loss_count:
+                loss_count = (targets != -100).sum()
+
+        if return_loss_count:
+            if loss_count is None:
+                raise ValueError("return_loss_count=True requires targets.")
+            return logits, loss, loss_count
+
 
         return logits, loss
 
@@ -249,12 +291,19 @@ class VisionLanguageModel(nn.Module):
         # Save weights as safetensors
         save_model(self, os.path.join(save_directory, "model.safetensors"))
 
-    def push_to_hub(self, repo_id: str, private: bool = False) -> None:
+    def push_to_hub(
+        self,
+        repo_id: str,
+        private: bool = False,
+        commit_message: str = "Upload nanoVLM using push_to_hub",
+    ) -> None:
         """
         Push the model and configuration to the Hugging Face Hub.
 
         Args:
             repo_id (str): The repo ID on the Hugging Face Hub.
+            private (bool): Whether to create/use a private repository.
+            commit_message (str): Commit message used for the upload.
         """
         from huggingface_hub import create_repo, upload_folder
 
@@ -276,7 +325,7 @@ class VisionLanguageModel(nn.Module):
                 repo_id=repo_id,
                 repo_type="model",
                 folder_path=save_path,
-                commit_message="Upload nanoVLM using push_to_hub",
+                commit_message=commit_message,
             )
 
 

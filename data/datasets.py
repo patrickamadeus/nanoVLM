@@ -1,7 +1,7 @@
 import torch
-from PIL import Image
 from torch.utils.data import Dataset
 from data.processors import get_image_string
+from data.image_utils import coerce_image_to_pil
 import logging
 
 
@@ -63,17 +63,12 @@ class BaseDataset(Dataset):
         processed_images = []
         splitted_image_counts = []
         for image in images:
-            if isinstance(image, Image.Image):
-                if image.mode != 'RGB':
-                    image = image.convert('RGB')
-                processed_image, splitted_image_count = self.image_processor(image)
-                if not hasattr(self.tokenizer, "global_image_token") and splitted_image_count[0]*splitted_image_count[1] == len(processed_image) - 1:
-                    # If the tokenizer doesn't have a global image token, but the processor generated it, remove it
-                    processed_image = processed_image[1:]
-                processed_images.append(processed_image)
-                splitted_image_counts.append(splitted_image_count)
-            else:
-                raise ValueError(f"Error processing image: {image}")
+            pil_image = coerce_image_to_pil(image)
+            processed_image, splitted_image_count = self.image_processor(pil_image)
+            if not hasattr(self.tokenizer, "global_image_token") and splitted_image_count[0]*splitted_image_count[1] == len(processed_image) - 1:
+                processed_image = processed_image[1:]
+            processed_images.append(processed_image)
+            splitted_image_counts.append(splitted_image_count)
         return processed_images, splitted_image_counts
 
 

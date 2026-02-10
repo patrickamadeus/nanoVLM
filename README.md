@@ -57,13 +57,13 @@ If you want to use `uv`:
 uv init --bare --python 3.12
 uv sync --python 3.12
 source .venv/bin/activate
-uv add torch numpy torchvision pillow datasets huggingface-hub transformers wandb
+uv add torch numpy torchvision pillow datasets huggingface-hub transformers wandb tqdm
 # Optional: for lmms-eval integration you have to install it from source, see section 'Evaluation with lmms-eval'
 ```
 
 If you prefer another environment manager, simply install these packages:  
 ```bash
-pip install torch numpy torchvision pillow datasets huggingface-hub transformers wandb
+pip install torch numpy torchvision pillow datasets huggingface-hub transformers wandb tqdm
 # Optional: for lmms-eval integration you have to install it from source, see section 'Evaluation with lmms-eval'
 
 ```
@@ -75,16 +75,21 @@ Dependencies:
 - `datasets` for the training datasets
 - `huggingface-hub` & `transformers` to load the pretrained backbones
 - `wandb` for logging
+- `tqdm` for training step progress bars
 
 ## Training
 
-To train nanoVLM, you can simply use the provided training script. After training, your model gets uploaded to the Hub!
+To train nanoVLM, you can simply use the provided training script.
 ```bash
 wandb login --relogin
 huggingface-cli login
 python train.py
 ```
 which will use the default `models/config.py`.
+
+`train.py` computes loss with `loss_reduction="sum"` and normalizes updates/metrics by the number of valid target tokens (`labels != -100`) across gradient accumulation (and across all ranks in DDP).
+When logging, `train/batch_loss` is the current microbatch token-normalized loss, and `train/step_loss` is the token-normalized loss used for the optimizer step.
+It also logs `effective_token_ratio_per_instance = mean_i(valid_target_tokens_i / attention_tokens_i)` for training.
 
 ## Generate
 

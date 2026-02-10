@@ -1,3 +1,5 @@
+from typing import Optional
+
 from transformers import AutoTokenizer
 import torchvision.transforms as transforms
 
@@ -5,7 +7,12 @@ from data.custom_transforms import DynamicResize, SplitImage, GlobalAndSplitImag
 
 TOKENIZERS_CACHE = {}
 
-def get_tokenizer(name, extra_special_tokens=None, chat_template=None):
+def get_tokenizer(
+    name,
+    extra_special_tokens=None,
+    chat_template=None,
+    model_max_length: Optional[int] = None,
+):
     if name not in TOKENIZERS_CACHE:
         tokenizer_init_kwargs = {"use_fast": True}
         if extra_special_tokens is not None:
@@ -15,7 +22,10 @@ def get_tokenizer(name, extra_special_tokens=None, chat_template=None):
         tokenizer = AutoTokenizer.from_pretrained(name, **tokenizer_init_kwargs,)
         tokenizer.pad_token = tokenizer.eos_token
         TOKENIZERS_CACHE[name] = tokenizer
-    return TOKENIZERS_CACHE[name]
+    tokenizer = TOKENIZERS_CACHE[name]
+    if model_max_length is not None:
+        tokenizer.model_max_length = model_max_length
+    return tokenizer
 
 def get_image_processor(max_img_size, splitted_image_size, resize_to_max_side_len=False):
     return transforms.Compose([
