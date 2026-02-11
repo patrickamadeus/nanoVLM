@@ -6,7 +6,7 @@ import os
 import tempfile
 from dataclasses import asdict
 from safetensors.torch import load_model as load_safetensors, save_model
-from models.dual_tower.dual_language_model import LanguageModel
+from models.language_model import LanguageModel
 from models.vision_language_model import VisionLanguageModel
 from models.config import VLMConfig
 from models.utils import top_k_top_p_filtering
@@ -68,133 +68,6 @@ class RightTower(LanguageModel):
         if freeze_decoder:
             for p in self.parameters():
                 p.requires_grad = False
-    
-    def forward(
-        self,
-        x: torch.Tensor,
-        attention_mask: torch.Tensor = None,
-        document_ids: torch.Tensor = None,
-        kv_cache: list[dict] = None,
-        start_pos = 0,
-    ):
-        if kv_cache is None:
-            raise ValueError("kv_cache must be provided from LeftTower result to RightTower.forward(). It cannot be None.")
-        
-        B, T_text, _ = x.size()
-        
-        # Create position_ids for the current text sequence based on start_pos
-        if isinstance(start_pos, torch.Tensor):
-             if start_pos.dim() == 1:
-                 start_pos = start_pos.unsqueeze(1) # (B, 1)
-             
-             # Create offsets [0, 1, ..., T_text-1]
-             offsets = torch.arange(T_text, device=x.device).unsqueeze(0) # (1, T_text)
-             current_position_ids = start_pos + offsets # (B, T_text)
-        else:
-            current_position_ids = torch.arange(start_pos, start_pos + T_text, device=x.device).unsqueeze(0).expand(B, -1)
-        
-        cos, sin = self.rotary_embd(current_position_ids)
-        
-        # Process through all transformer blocks
-        # kv_cache is List[N] for N layers
-        # Each layer i uses kv_cache[i] for its own attention mechanism
-        for i, block in enumerate(self.blocks):
-            x, kv_cache[i] = block(
-                x,
-                cos,
-                sin,
-                attention_mask=attention_mask,
-                block_kv_cache=kv_cache[i],
-                document_ids=document_ids,
-            )
-        
-        # Final normalization
-        x = self.norm(x)
-        
-        # Compute logits if we are using tokens, otherwise stay in the embedding space
-        if self.lm_use_tokens:
-            x = self.head(x)
-        
-        return x, kv_cache
-
-    @torch.inference_mode()
-    def generate(self, inputs: torch.Tensor, max_new_tokens: int=20, attention_mask: torch.Tensor=None):
-        """
-        Generate tokens autoregressively from a given input sequence.
-
-        Args:
-            inputs (torch.Tensor): Input tensor containing token indices or embeddings.
-                Shape: (batch_size, sequence_length) or (sequence_length,) for a single sequence.
-            max_new_tokens (int): Number of new tokens to generate after the input sequence.
-            attention_mask (torch.Tensor, optional): Attention mask for the input sequence.
-                Shape: (batch_size, sequence_length). 1 for valid tokens, 0 for padding.
-
-        Returns:
-            torch.Tensor: The generated sequence, including the original inputs and newly generated tokens.
-                Shape: (batch_size, sequence_length + max_new_tokens)
-        """
-        # Add batch dimension if needed
-        if inputs.dim() == 1:
-            inputs = inputs.unsqueeze(0)
-        generated_outputs = inputs.clone()
-        
-        # Handle attention mask
-        if attention_mask is None:
-            # If no mask provided, assume all tokens are valid
-            attention_mask = torch.ones_like(inputs, dtype=torch.long)
-        elif attention_mask.dim() == 1:
-            attention_mask = attention_mask.unsqueeze(0)
-        
-        # Clone the attention mask so we can extend it during generation
-        current_attention_mask = attention_mask.clone()
-
-        #  -- Prefill phase --
-        prompt_output, kv_cache_list = self.forward(
-            generated_outputs, 
-            attention_mask=current_attention_mask,
-            kv_cache=None,
-            start_pos=0
-        )
-        last_output = prompt_output[:, -1, :]
-        
-        # count non <pad> area, this is the valid final position ID before autoregressive increment++
-        # Skippable: track actual valid tokens count per sample
-        # Note: Even though we pass single-token mask during generation loop to forward(), 
-        # this `current_token_start_pos` tensor maintains the correct cumulative position (accounting for skipped pads)
-        # which we pass as `start_pos` to correctly generate position_ids in forward().
-        current_token_start_pos = current_attention_mask.sum(dim=1) - 1 # Shape (B,)
-
-        # Autoregressive generation loop up to `max_new_tokens`
-        for i in range(max_new_tokens):
-            if self.lm_use_tokens:
-                # Now the model outputs logits
-                next_output = torch.argmax(last_output, dim=-1, keepdim=True)
-            else:
-                # Now the model outputs embeddings
-                next_output = last_output.unsqueeze(1)
-
-            generated_outputs = torch.cat((generated_outputs, next_output), dim=1)
-            
-            # Extend attention mask for the new token (it's always valid, not padding, so extend [...,1])
-            new_token_mask = torch.ones((current_attention_mask.size(0), 1), 
-                                        dtype=current_attention_mask.dtype, 
-                                        device=current_attention_mask.device)
-            current_attention_mask = torch.cat([current_attention_mask, new_token_mask], dim=1)
-            
-            # increment pos ID for next token
-            current_token_start_pos += 1
-            if i == max_new_tokens - 1: 
-                break
-
-            decode_step_output, kv_cache_list = self.forward(
-                next_output, 
-                attention_mask=current_attention_mask,
-                kv_cache=kv_cache_list,
-                start_pos=current_token_start_pos
-            )
-            last_output = decode_step_output[:, -1, :] 
-    
-        return generated_outputs
 
 
 class DualTowerVLM(nn.Module):
@@ -222,6 +95,13 @@ class DualTowerVLM(nn.Module):
             load_backbone=load_backbone,
             freeze_decoder=freeze_right_decoder,
         )
+        self.left_tower_mask_mode = getattr(cfg, "left_tower_mask_mode", "visual_only")
+        valid_modes = {"visual_only", "visual_plus_prefix", "full"}
+        if self.left_tower_mask_mode not in valid_modes:
+            raise ValueError(
+                f"Unsupported left_tower_mask_mode={self.left_tower_mask_mode!r}. "
+                f"Expected one of {sorted(valid_modes)}."
+            )
         self.tokenizer = self.left_tower.tokenizer
         self._kv_replace_token_ids = self._collect_kv_replace_token_ids()
 
@@ -247,32 +127,85 @@ class DualTowerVLM(nn.Module):
     def _annotate_left_kv_cache(self, kv_cache: list[dict], input_ids: torch.Tensor, attention_mask: torch.Tensor = None):
         # Right tower uses this mask to keep left-tower K/V on visual marker token positions.
         # This includes <|image|>, <|global_image|>, and row/col locator tokens.
-        replace_ids = self._kv_replace_token_ids.to(input_ids.device)
-        img_mask = torch.isin(input_ids, replace_ids)
-        if attention_mask is not None:
-            img_mask = img_mask & attention_mask.to(torch.bool)
+        img_mask = self._build_visual_token_mask(input_ids, attention_mask)
         for layer_cache in kv_cache:
             layer_cache["img_mask"] = img_mask
             layer_cache["needs_dual_prefill"] = True
         return kv_cache
 
+    def _build_visual_token_mask(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        replace_ids = self._kv_replace_token_ids.to(input_ids.device)
+        visual_mask = torch.isin(input_ids, replace_ids)
+        if attention_mask is not None:
+            visual_mask = visual_mask & attention_mask.to(torch.bool)
+        return visual_mask
+
+    def _build_left_tower_attention_mask(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        mode = self.left_tower_mask_mode
+
+        if mode == "full":
+            if attention_mask is None:
+                return torch.ones_like(input_ids, dtype=torch.long)
+            return attention_mask.to(dtype=torch.long)
+
+        visual_mask = self._build_visual_token_mask(input_ids, attention_mask)
+        if mode == "visual_only":
+            # Left tower is constrained to visual structure tokens only.
+            return visual_mask.to(dtype=torch.long)
+
+        # mode == "visual_plus_prefix":
+        # For each contiguous valid segment, include the prefix tokens before the first visual token.
+        if attention_mask is None:
+            valid_mask = torch.ones_like(input_ids, dtype=torch.bool)
+        else:
+            valid_mask = attention_mask.to(torch.bool)
+
+        prefix_mask = torch.zeros_like(valid_mask)
+        B, T = input_ids.shape
+        for b in range(B):
+            valid_idx = torch.nonzero(valid_mask[b], as_tuple=False).flatten()
+            if valid_idx.numel() == 0:
+                continue
+
+            # Split into contiguous valid spans (packing separators are attention_mask=0 gaps).
+            breaks = torch.nonzero((valid_idx[1:] - valid_idx[:-1]) > 1, as_tuple=False).flatten().tolist()
+            starts = [valid_idx[0].item()] + [valid_idx[i + 1].item() for i in breaks]
+            ends = [valid_idx[i].item() for i in breaks] + [valid_idx[-1].item()]
+
+            for start, end in zip(starts, ends):
+                segment_visual = visual_mask[b, start : end + 1]
+                segment_visual_idx = torch.nonzero(segment_visual, as_tuple=False).flatten()
+                if segment_visual_idx.numel() == 0:
+                    continue
+                first_visual = start + int(segment_visual_idx[0].item())
+                if first_visual > start:
+                    prefix_mask[b, start:first_visual] = True
+
+        return (visual_mask | prefix_mask).to(dtype=torch.long)
+
     def forward(
         self,
         input_ids: torch.Tensor,
         images,
-        last_img_idx: torch.Tensor = None,
         attention_mask: torch.Tensor = None,
-        document_ids: torch.Tensor = None,
         targets: torch.Tensor = None,
         loss_reduction: str = "mean",
         return_loss_count: bool = False,
     ):
-        _ = last_img_idx  # kept for backward compatibility with older training/eval call sites
+        left_attention_mask = self._build_left_tower_attention_mask(input_ids, attention_mask)
         # Process the full sequence through left tower, then reuse its image-token K/V in right tower.
         _, kv_cache = self.left_tower(
             input_ids=input_ids,
             images=images,
-            attention_mask=attention_mask,
+            attention_mask=left_attention_mask,
         )
         kv_cache = self._annotate_left_kv_cache(kv_cache, input_ids, attention_mask)
 
@@ -282,7 +215,6 @@ class DualTowerVLM(nn.Module):
         logits, _ = self.right_tower(
             x=full_embd,
             attention_mask=attention_mask,
-            document_ids=document_ids,
             kv_cache=kv_cache,
             start_pos=0,
         )
@@ -313,7 +245,6 @@ class DualTowerVLM(nn.Module):
         self,
         input_ids: torch.Tensor,
         images,
-        last_img_idx: torch.Tensor = None,
         attention_mask: torch.Tensor = None,
         max_new_tokens: int = 50,
         top_k: int = 50,
@@ -327,7 +258,6 @@ class DualTowerVLM(nn.Module):
         Args:
             input_ids (torch.Tensor): Input token IDs of shape (B, T)
             images: Images to process (can be list or tensor)
-            last_img_idx (torch.Tensor): Deprecated. Kept for backward compatibility.
             attention_mask (torch.Tensor, optional): Attention mask of shape (B, T)
             max_new_tokens (int): Number of new tokens to generate
             top_k (int): Top-k filtering parameter for sampling
@@ -338,7 +268,6 @@ class DualTowerVLM(nn.Module):
         Returns:
             torch.Tensor: Generated token IDs of shape (B, max_new_tokens)
         """
-        _ = last_img_idx  # kept for backward compatibility with older generation call sites
         B = input_ids.size(0)
         device = input_ids.device
         
@@ -352,12 +281,13 @@ class DualTowerVLM(nn.Module):
             attention_mask = torch.ones_like(input_ids, dtype=torch.long)
         elif attention_mask.dim() == 1:
             attention_mask = attention_mask.unsqueeze(0)
+        left_attention_mask = self._build_left_tower_attention_mask(input_ids, attention_mask)
         
         # Process left tower to get image KV cache
         _, kv_cache = self.left_tower(
             input_ids=input_ids,
             images=images,
-            attention_mask=attention_mask,
+            attention_mask=left_attention_mask,
         )
         kv_cache = self._annotate_left_kv_cache(kv_cache, input_ids, attention_mask)
         
@@ -382,8 +312,6 @@ class DualTowerVLM(nn.Module):
         else:
             current_logits = last_output
         
-        current_token_start_pos = attention_mask.sum(dim=1) - 1 # Shape (B,)
-
         newly_generated_ids_list = []
         current_attention_mask = attention_mask.clone()
         
@@ -401,9 +329,9 @@ class DualTowerVLM(nn.Module):
             
             # Embed the newly generated token
             next_token_embed = self.right_tower.token_embedding(next_token_id)  # [B, 1, D_lm]
-            
-            # The start_pos for the new token is the current total sequence length *before* adding this new token
-            current_token_start_pos += 1
+
+            # Decode position must follow KV-cache index space (includes any padded prefix positions).
+            current_token_start_pos = kv_cache[0]["key"].size(2)
             
             # Update attention mask
             new_token_mask = torch.ones((B, 1), 

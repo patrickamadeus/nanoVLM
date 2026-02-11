@@ -224,8 +224,6 @@ class LanguageModelGroupedQueryAttention(nn.Module):
                 - Output tensor after attention and projection, shape (B, T_curr, C).
                 - Updated block_kv_cache dict for caching key-value states.
         """
-        is_prefill = block_kv_cache is None
-
         B, T_curr, C = x.size() # T_curr is the sequence length of the current input x
 
         q_curr = self.q_proj(x).view(B, T_curr, self.n_heads, self.head_dim).transpose(1, 2)  # (B, n_heads, T_curr, head_dim)
@@ -235,21 +233,49 @@ class LanguageModelGroupedQueryAttention(nn.Module):
         # Apply rotary embeddings to the current q and k
         q, k_rotated = apply_rotary_pos_embd(q_curr, k_curr, cos, sin)
 
-        # Check if we can use cached keys and values
-        if not is_prefill and block_kv_cache['key'] is not None:
-            # Concatenate with cached K, V
-            # k_rotated and v_curr are for the new token(s)
-            k = block_kv_cache['key']
-            v = block_kv_cache['value']
-            k = torch.cat([k, k_rotated], dim=2)
-            v = torch.cat([v, v_curr], dim=2)
-            block_kv_cache['key'] = k
-            block_kv_cache['value'] = v
-        else:
+        if block_kv_cache is None:
             # No cache, this is the first pass (prefill)
             k = k_rotated
             v = v_curr
             block_kv_cache = {'key': k, 'value': v}
+        else:
+            k_cached = block_kv_cache.get("key")
+            v_cached = block_kv_cache.get("value")
+            needs_dual_prefill = bool(block_kv_cache.get("needs_dual_prefill", False))
+            img_mask = block_kv_cache.get("img_mask")
+
+            # Optional dual-prefill mode:
+            # replace cached K/V only on selected visual-token positions.
+            if needs_dual_prefill:
+                if k_cached is None or v_cached is None:
+                    raise ValueError("Dual prefill requires existing cached `key` and `value` tensors.")
+                if k_cached.size(2) != T_curr:
+                    raise ValueError(
+                        f"Dual prefill expects cached length == current length, got cache={k_cached.size(2)}, curr={T_curr}."
+                    )
+                if img_mask is None or img_mask.shape != (B, T_curr):
+                    raise ValueError(
+                        f"Dual prefill `img_mask` shape must be {(B, T_curr)}, got {None if img_mask is None else tuple(img_mask.shape)}."
+                    )
+
+                mask_4d = img_mask.to(device=x.device, dtype=torch.bool).unsqueeze(1).unsqueeze(-1)  # [B,1,T,1]
+                k = torch.where(mask_4d, k_cached, k_rotated)
+                v = torch.where(mask_4d, v_cached, v_curr)
+                block_kv_cache['key'] = k
+                block_kv_cache['value'] = v
+                block_kv_cache['needs_dual_prefill'] = False
+            elif k_cached is not None and v_cached is not None:
+                # Standard decode path: append new K/V to cached prefix.
+                k = torch.cat([k_cached, k_rotated], dim=2)
+                v = torch.cat([v_cached, v_curr], dim=2)
+                block_kv_cache['key'] = k
+                block_kv_cache['value'] = v
+            else:
+                # Fallback to prefill semantics if an empty cache container is provided.
+                k = k_rotated
+                v = v_curr
+                block_kv_cache['key'] = k
+                block_kv_cache['value'] = v
 
         # Repeat K, V for Grouped Query Attention
         k_exp = k.repeat_interleave(self.n_kv_groups, dim=1) # (B, n_heads, T_kv, head_dim)

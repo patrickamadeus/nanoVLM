@@ -52,6 +52,7 @@ class VLMConfig:
     vlm_load_backbone_weights: bool = True
     vlm_checkpoint_path: str = 'lusxvr/nanoVLM-230M-8k'
     hf_repo_name: str = 'nanoVLM'
+    left_tower_mask_mode: str = "visual_only"  # DualTower left-tower masking: visual_only | visual_plus_prefix | full
 
 
 @dataclass
@@ -74,13 +75,14 @@ class TrainConfig:
     max_images_per_example: int = 1
     max_images_per_knapsack: int = 18
     max_sample_length: int = 2048
+    use_packing: bool = True
     compile: bool = False
     resume_from_vlm_checkpoint: bool = True # Continue training from a full VLM checkpoint.
     train_dataset_path: str = 'patrickamadeus/the_cauldron'
     train_dataset_name: tuple[str, ...] = ("all", ) #('allava_laion', 'allava_vflan', 'cambrian(filtered)_processed', 'LLaVA_Instruct_150K', 'mmevol', 'sharegpt4o', 'sharegpt4v(coco)', 'sharegpt4v(knowledge)', 'sharegpt4v(llava)', 'sharegpt4v(sam)') # 'vision_flan(filtered)', 'lvis_instruct4v',
     train_split: str = "train"
     val_split: str = "validation"
-    stream_dataset: bool = True
+    stream_dataset: bool = False
     relevance_min_rating: int = 1
     image_correspondence_min_rating: int = 1
     visual_dependency_min_rating: int = 1
@@ -92,6 +94,6 @@ class TrainConfig:
     lmms_eval_limit: float = None
     lmms_eval_batch_size: int = 64
     push_checkpoints_to_hub: bool = True
-    checkpoint_repo_pattern: str = "patrickamadeus/dt2k1i-step-{i}"
+    checkpoint_repo_pattern: str = "patrickamadeus/nanovlm-step-{i}"
     hf_private: bool = False
     push_final_model_to_hub: bool = False
