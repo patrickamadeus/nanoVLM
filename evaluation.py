@@ -29,14 +29,14 @@ from lmms_eval import evaluator, utils
 from lmms_eval.api.registry import ALL_TASKS
 from lmms_eval.evaluator import request_caching_arg_to_dict
 from lmms_eval.loggers import EvaluationTracker, WandbLogger
-from lmms_eval.tasks import TaskManager
+from lmms_eval.tasks import TaskManager, get_task_dict
 from lmms_eval.utils import (
     handle_non_serializable,
     make_table,
     simple_parse_args_string,
 )
 
-from eval.lmms_eval_wrapper import NanoVLMWrapper
+from eval.lmms_eval_wrapper import DualTowerWrapper, NanoVLMWrapper
 
 
 def _int_or_none_list_arg_type(min_len: int, max_len: int, defaults: str, value: str, split_char: str = ","):
@@ -86,8 +86,59 @@ def _handle_non_serializable(o):
         return str(o)
 
 
+def _parse_bool(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y"}
+    return False
+
+
+def _safe_int(value, default: int = 1) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _build_wrapped_model(args):
+    wrapper_batch_size = _safe_int(args.batch_size, default=1)
+    if args.mode == "dualtower":
+        model_kwargs = simple_parse_args_string(args.model_args) if args.model_args else {}
+        config_path = model_kwargs.pop("config_path", None)
+        load_backbone = _parse_bool(model_kwargs.pop("load_backbone", False))
+        max_length = model_kwargs.pop("max_length", None)
+        if max_length is not None:
+            max_length = int(max_length)
+        return DualTowerWrapper(
+            model=args.model,
+            device=args.device,
+            batch_size=wrapper_batch_size,
+            config_path=config_path,
+            load_backbone=load_backbone,
+            max_length=max_length,
+            **model_kwargs,
+        )
+    return NanoVLMWrapper(
+        model=args.model,
+        device=args.device,
+        batch_size=wrapper_batch_size,
+    )
+
+
 def parse_eval_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(formatter_class=argparse.RawTextHelpFormatter)
+    parser.add_argument(
+        "--mode",
+        type=str,
+        default="nanovlm",
+        choices=["nanovlm", "dualtower"],
+        help="Evaluation mode. Selects the wrapper and expected model_args.",
+    )
     parser.add_argument("--config", default="", help="Path to a yaml file specifying all eval arguments, will ignore cli arguments if specified")
     parser.add_argument("--model", default="hf", help="Name of model e.g. `hf`")
     parser.add_argument(
@@ -98,7 +149,10 @@ def parse_eval_args() -> argparse.Namespace:
     parser.add_argument(
         "--model_args",
         default="",
-        help="String arguments for model, e.g. `pretrained=EleutherAI/pythia-160m,dtype=float32`",
+        help=(
+            "String arguments for model, e.g. `pretrained=EleutherAI/pythia-160m,dtype=float32`. "
+            "DualTower extras: `config_path=/path/to/config.json,load_backbone=false,max_length=2048`."
+        ),
     )
     parser.add_argument(
         "--num_fewshot",
@@ -289,7 +343,8 @@ def cli_evaluate(args: Union[argparse.Namespace, None] = None) -> None:
     if args is None and len(sys.argv) == 1:
         print("┌───────────────────────────────────────────────────────────────────────────────┐")
         print("│ Please provide arguments to evaluate the model. e.g.                          │")
-        print("│ `python evaluation.py  --model lusxvr/nanoVLM-450M --tasks mmstar`            │")
+        print("│ `python evaluation.py --mode nanovlm --model lusxvr/nanoVLM-450M --tasks mmstar` │")
+        print("│ `python evaluation.py --mode dualtower --model <repo-or-path> --tasks mmstar` │")
         print("└───────────────────────────────────────────────────────────────────────────────┘")
         sys.exit(1)
 
@@ -490,11 +545,7 @@ def cli_evaluate_single(args: Union[argparse.Namespace, None] = None) -> None:
     request_caching_args = request_caching_arg_to_dict(cache_requests=args.cache_requests)
     datetime_str = utils.get_datetime_str(timezone=args.timezone)
 
-    wrapped_model = NanoVLMWrapper(
-        model=args.model,
-        device=args.device,
-        batch_size=int(args.batch_size),
-    )
+    wrapped_model = _build_wrapped_model(args)
 
     results = evaluator.simple_evaluate(
         model=wrapped_model,

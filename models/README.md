@@ -21,3 +21,9 @@ This is a simple MLP (Linear Layer) for the Modality Projection between the Imag
 ## Vision-Language-Model
 
 This brings all the individual parts together and handles the concatenation of images and text. Built as a simple version of SmolVLM (https://arxiv.org/pdf/2504.05299)
+
+## DualTowerVLM
+
+Dual-tower architecture is available under `models/dual_tower/`:
+- `dual_tower.py`: left/right tower orchestration and hub save/load helpers
+- `dual_language_model.py`: language model variant used by the right tower with dual-prefill KV replacement support

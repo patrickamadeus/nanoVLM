@@ -31,7 +31,7 @@ class VLMConfig:
     lm_use_tokens: bool = False # Decide if the LM expects tokens or embeddings as input (if using as a backbone for the VLM, set to False)
     lm_tie_weights: bool = True # Decide if you want to tie the LM Head weight to the token embedding weights
     lm_model_type: str = 'HuggingFaceTB/SmolLM2-135M-Instruct' #'HuggingFaceTB/SmolLM2-135M' #
-    lm_tokenizer: str = 'HuggingFaceTB/SmolLM2-360M-Instruct'
+    lm_tokenizer: str = 'HuggingFaceTB/SmolLM2-135M-Instruct'
     lm_chat_template: str = "{% for message in messages %}{{'<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>' + '\n'}}{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant\n' }}{% endif %}"
 
     mp_pixel_shuffle_factor: int = 4
@@ -59,9 +59,12 @@ class TrainConfig:
     lr_mp: float = 5e-5
     lr_vision_backbone: float = 0 #0.0005 #
     lr_language_backbone: float = 1e-5 #0
+    # DualTower-specific explicit LR controls. If None, falls back to lr_language_backbone.
+    lr_left_tower: float | None = None
+    lr_right_tower: float | None = 0.0
     val_size: int = 50000  # Deprecated when using explicit train/val splits.
-    batch_size: int = 8
-    gradient_accumulation_steps: int = 16
+    batch_size: int = 16
+    gradient_accumulation_steps: int = 8
     max_grad_norm: float = 1.0
     eval_in_epochs: bool = True
     eval_interval: int = 500
@@ -89,6 +92,6 @@ class TrainConfig:
     lmms_eval_limit: float = None
     lmms_eval_batch_size: int = 64
     push_checkpoints_to_hub: bool = True
-    checkpoint_repo_pattern: str = "patrickamadeus/test8x16-step-{i}"
+    checkpoint_repo_pattern: str = "patrickamadeus/dt2k1i-step-{i}"
     hf_private: bool = False
     push_final_model_to_hub: bool = False

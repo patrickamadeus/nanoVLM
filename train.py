@@ -1,6 +1,7 @@
 import os
 import math
 import time
+import textwrap
 import torch
 import wandb
 import numpy
@@ -31,6 +32,9 @@ from data.processors import get_image_processor, get_tokenizer
 
 import models.config as config
 from models.vision_language_model import VisionLanguageModel
+from models.dual_tower.dual_language_model import LanguageModel as DualLanguageModel
+from models.dual_tower.dual_tower import DualTowerVLM
+from train_utils.console import ctext, log_debug, log_info, log_success, log_warn, progress_color
 
 #Otherwise, the tokenizer will throw a warning
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -46,6 +50,7 @@ warnings.filterwarnings(
 # Fix for "Decompressed data too large" error with certain PNGs
 import PIL.PngImagePlugin
 PIL.PngImagePlugin.MAX_TEXT_CHUNK = 100 * 1024 * 1024
+VAL_DEBUG_SAMPLE_INTERVAL = 100
 
 def seed_worker(worker_id):
     worker_seed = torch.initial_seed() % 2**32
@@ -114,6 +119,14 @@ def get_run_name(train_cfg, vlm_cfg):
 
 def get_optimizer_lrs(optimizer, train_cfg):
     lrs = {}
+    for group in optimizer.param_groups:
+        group_name = group.get("name")
+        if group_name:
+            lrs[group_name] = group["lr"]
+    if lrs:
+        return lrs
+
+    # Backward-compatible fallback when groups are unnamed.
     param_group_idx = 0
     if train_cfg.lr_mp > 0:
         lrs["lr_mp"] = optimizer.param_groups[param_group_idx]["lr"]
@@ -151,7 +164,7 @@ def _load_dataset_split(train_cfg, dataset_name, split_name):
     return ds
 
 def get_dataloaders(train_cfg, vlm_cfg):
-    print(f"Getting dataloaders from {train_cfg.train_dataset_path}")
+    log_info(f"Getting dataloaders from {ctext(train_cfg.train_dataset_path, 'cyan', attrs=('bold',))}")
     if train_cfg.max_sample_length > vlm_cfg.lm_max_length:
         raise ValueError(
             f"max_sample_length ({train_cfg.max_sample_length}) must be <= lm_max_length ({vlm_cfg.lm_max_length})"
@@ -167,7 +180,7 @@ def get_dataloaders(train_cfg, vlm_cfg):
 
     dataset_names_to_load = train_cfg.train_dataset_name
     if "shards" in train_cfg.train_dataset_name:
-        print("Loading shards")
+        log_info("Loading shards")
         total_shards = 56
         dataset_names_to_load = [train_cfg.train_dataset_path + f"/shard_{i}" for i in range(total_shards)]
 
@@ -179,7 +192,7 @@ def get_dataloaders(train_cfg, vlm_cfg):
     combined_val_data = []
 
     for dataset_name in dataset_names_to_load:
-        print(f"Loading dataset: {dataset_name}")
+        log_info(f"Loading dataset: {ctext(dataset_name, 'cyan', attrs=('bold',))}")
         try:
             train_ds = _load_dataset_split(train_cfg, dataset_name, train_cfg.train_split)
             val_ds = _load_dataset_split(train_cfg, dataset_name, train_cfg.val_split)
@@ -195,7 +208,7 @@ def get_dataloaders(train_cfg, vlm_cfg):
             combined_val_data.append(val_ds)
         except Exception as e:
             if is_master():
-                print(
+                log_warn(
                     f"Warning: Failed to load dataset config '{dataset_name}' from "
                     f"'{train_cfg.train_dataset_path}' with splits "
                     f"'{train_cfg.train_split}'/'{train_cfg.val_split}'. Error: {e}"
@@ -240,10 +253,10 @@ def get_dataloaders(train_cfg, vlm_cfg):
         train_cfg.formatting_min_rating,
     )
 
-    train_dataset = ConstantLengthDataset(train_dataset, infinite=False, max_sample_length=train_cfg.max_sample_length, seq_length=vlm_cfg.lm_max_length, num_of_sequences=train_cfg.batch_size*4, queue_size=8,
+    train_dataset = ConstantLengthDataset(train_dataset, infinite=False, max_sample_length=train_cfg.max_sample_length, seq_length=vlm_cfg.lm_max_length, num_of_sequences=train_cfg.batch_size*4, queue_size=4,
                                         max_images_per_example=train_cfg.max_images_per_example, max_images_per_knapsack=train_cfg.max_images_per_knapsack)
 
-    val_dataset = ConstantLengthDataset(val_dataset, infinite=False, max_sample_length=train_cfg.max_sample_length, seq_length=vlm_cfg.lm_max_length, num_of_sequences=train_cfg.batch_size*4, queue_size=8,
+    val_dataset = ConstantLengthDataset(val_dataset, infinite=False, max_sample_length=train_cfg.max_sample_length, seq_length=vlm_cfg.lm_max_length, num_of_sequences=train_cfg.batch_size*4, queue_size=4,
                                         max_images_per_example=train_cfg.max_images_per_example, max_images_per_knapsack=train_cfg.max_images_per_knapsack)
 
     # Create collators
@@ -258,7 +271,7 @@ def get_dataloaders(train_cfg, vlm_cfg):
         train_dataset,
         batch_size=train_cfg.batch_size,    # =per device BS in DDP
         collate_fn=vqa_collator,
-        num_workers=0,
+        num_workers=2,
         pin_memory=False,
         persistent_workers=False,
         drop_last=True,
@@ -270,7 +283,7 @@ def get_dataloaders(train_cfg, vlm_cfg):
         val_dataset,
         batch_size=train_cfg.batch_size,
         collate_fn=vqa_collator,
-        num_workers=0,
+        num_workers=2,
         pin_memory=False,
         persistent_workers=False,
         drop_last=True,
@@ -279,12 +292,12 @@ def get_dataloaders(train_cfg, vlm_cfg):
     )
 
     # Warmup dataloaders to kickstart worker processes
-    print("Warming up dataloaders...")   
+    log_info("Warming up dataloaders...")
     iter_train_loader = iter(train_loader)
     iter_val_loader = iter(val_loader)
     next(iter_train_loader)
     next(iter_val_loader)
-    print("Warmup complete.")
+    log_success("Warmup complete.")
 
     return train_loader, val_loader, iter_train_loader, iter_val_loader
 
@@ -305,7 +318,69 @@ def get_lr(it, max_lr, max_steps):
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff starts at 1 and goes to 0
     return min_lr + coeff * (max_lr - min_lr)
 
-def train(train_cfg, vlm_cfg):
+
+def _base_model(model):
+    return model.module if hasattr(model, "module") else model
+
+
+def _short_text(text, limit=245):
+    text = text.replace("\n", " ").strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "..."
+
+
+def _split_debug_lines(text: str, width: int = 52) -> list[str]:
+    if not text:
+        return [""]
+    wrapped = textwrap.wrap(text.strip(), width=width)
+    return wrapped if wrapped else [""]
+
+
+def _log_pred_vs_target(step: int, pred_text: str, target_text: str, *, tag: str) -> None:
+    left_lines = _split_debug_lines(pred_text)
+    right_lines = _split_debug_lines(target_text)
+    rows = max(len(left_lines), len(right_lines))
+    left_lines.extend([""] * (rows - len(left_lines)))
+    right_lines.extend([""] * (rows - len(right_lines)))
+    log_debug(
+        f"[{tag}][step={ctext(step, 'yellow', attrs=('bold',))}] "
+        f"{ctext('PRED', 'yellow', attrs=('bold',))} | "
+        f"{ctext('GT', 'green', attrs=('bold',))}"
+    )
+    for left, right in zip(left_lines, right_lines):
+        log_debug(f"{ctext(left.ljust(54), 'yellow')} | {ctext(right, 'green')}")
+
+
+def _build_decode_preview(model, logits, labels):
+    tokenizer = getattr(_base_model(model), "tokenizer", None)
+    if tokenizer is None:
+        return None
+    if logits is None or logits.ndim != 3 or labels.ndim != 2:
+        return None
+    if logits.size(0) == 0 or labels.size(0) == 0:
+        return None
+
+    valid_mask = labels[0] != -100
+    if int(valid_mask.sum().item()) == 0:
+        return None
+
+    pred_ids = torch.argmax(logits[0].detach(), dim=-1)[valid_mask].to("cpu")
+    target_ids = labels[0][valid_mask].detach().to("cpu")
+    pred_text = _short_text(tokenizer.decode(pred_ids.tolist(), skip_special_tokens=True))
+    target_text = _short_text(tokenizer.decode(target_ids.tolist(), skip_special_tokens=True))
+    return pred_text, target_text
+
+
+def _apply_checkpoint_cfg_overrides(loaded_cfg, requested_cfg):
+    if loaded_cfg is None:
+        raise ValueError("Loaded checkpoint model is missing `cfg`.")
+    loaded_cfg.lm_max_length = requested_cfg.lm_max_length
+    loaded_cfg.lm_max_position_embeddings = requested_cfg.lm_max_position_embeddings
+    loaded_cfg.resize_to_max_side_len = getattr(requested_cfg, "resize_to_max_side_len", False)
+    return loaded_cfg
+
+def train(train_cfg, vlm_cfg, model_mode: str = "nanovlm"):
     if train_cfg.checkpoint_interval <= 0:
         raise ValueError("checkpoint_interval must be > 0.")
     try:
@@ -322,12 +397,12 @@ def train(train_cfg, vlm_cfg):
     train_loader, val_loader, iter_train_loader, iter_val_loader = get_dataloaders(train_cfg, vlm_cfg)
 
     if is_dist():
-        print("Rank", get_rank(), "Waiting for all workers to get dataloaders...")
+        log_info(f"Rank {get_rank()} waiting for all workers to get dataloaders...")
         if is_master():
-            print("Waiting for all workers to get dataloaders...")
+            log_info("Waiting for all workers to get dataloaders...")
         dist.barrier(device_ids=int(os.environ["LOCAL_RANK"]))
         if is_master():
-            print("All workers have gotten dataloaders.")
+            log_success("All workers have loaded dataloaders.")
 
     run_name = get_run_name(train_cfg, vlm_cfg)
     run = None
@@ -344,11 +419,33 @@ def train(train_cfg, vlm_cfg):
 
     # Initialize model
     if train_cfg.resume_from_vlm_checkpoint:
-        print(f"Resuming from VLM checkpoint: {vlm_cfg.vlm_checkpoint_path}")
-        model = VisionLanguageModel.from_pretrained(vlm_cfg.vlm_checkpoint_path)
+        log_info(f"Loading VLM checkpoint: {ctext(vlm_cfg.vlm_checkpoint_path, 'cyan', attrs=('bold',))}")
+        vlm_model = VisionLanguageModel.from_pretrained(vlm_cfg.vlm_checkpoint_path)
+        vlm_cfg = _apply_checkpoint_cfg_overrides(getattr(vlm_model, "cfg", None), vlm_cfg)
+        if model_mode == "dualtower":
+            model = DualTowerVLM(
+                vlm_cfg,
+                load_backbone=False,
+            )
+            model.left_tower.vision_encoder.load_state_dict(vlm_model.vision_encoder.state_dict())
+            model.left_tower.MP.load_state_dict(vlm_model.MP.state_dict())
+            model.left_tower.decoder.load_state_dict(vlm_model.decoder.state_dict())
+            right_lm = DualLanguageModel.from_pretrained(vlm_cfg)
+            model.right_tower.load_state_dict(right_lm.state_dict())
+            del right_lm
+            del vlm_model
+            log_success("Initialized dualtower from VLM checkpoint (left tower) + LM backbone (right tower).")
+        else:
+            model = vlm_model
 
         # Override model's max_seq_len, max_position_embeddings, and any relevant sample length to config values
         # Use attribute names as in VLMConfig (lm_max_length, lm_max_position_embeddings, max_sample_length)
+        if hasattr(model, "cfg"):
+            if hasattr(vlm_cfg, "lm_max_length"):
+                model.cfg.lm_max_length = vlm_cfg.lm_max_length
+            if hasattr(vlm_cfg, "lm_max_position_embeddings"):
+                model.cfg.lm_max_position_embeddings = vlm_cfg.lm_max_position_embeddings
+
         if hasattr(model, "max_seq_len") and hasattr(vlm_cfg, "lm_max_length"):
             model.max_seq_len = vlm_cfg.lm_max_length
         if hasattr(model, "max_position_embeddings") and hasattr(vlm_cfg, "lm_max_position_embeddings"):
@@ -359,6 +456,31 @@ def train(train_cfg, vlm_cfg):
                 model.decoder.max_seq_len = vlm_cfg.lm_max_length
             if hasattr(model.decoder, "max_position_embeddings") and hasattr(vlm_cfg, "lm_max_position_embeddings"):
                 model.decoder.max_position_embeddings = vlm_cfg.lm_max_position_embeddings
+
+        if model_mode == "dualtower":
+            # DualTowerVLM has two language decoders; propagate overrides to both.
+            dual_decoders = []
+            if hasattr(model, "left_tower") and hasattr(model.left_tower, "decoder"):
+                dual_decoders.append(model.left_tower.decoder)
+            if hasattr(model, "right_tower"):
+                dual_decoders.append(model.right_tower)
+
+            for decoder in dual_decoders:
+                if hasattr(vlm_cfg, "lm_max_length") and hasattr(decoder, "max_seq_len"):
+                    decoder.max_seq_len = vlm_cfg.lm_max_length
+                if hasattr(vlm_cfg, "lm_max_position_embeddings") and hasattr(decoder, "max_position_embeddings"):
+                    decoder.max_position_embeddings = vlm_cfg.lm_max_position_embeddings
+                if hasattr(decoder, "cfg"):
+                    if hasattr(vlm_cfg, "lm_max_length"):
+                        decoder.cfg.lm_max_length = vlm_cfg.lm_max_length
+                    if hasattr(vlm_cfg, "lm_max_position_embeddings"):
+                        decoder.cfg.lm_max_position_embeddings = vlm_cfg.lm_max_position_embeddings
+                if hasattr(decoder, "rotary_embd"):
+                    if hasattr(vlm_cfg, "lm_max_position_embeddings") and hasattr(decoder.rotary_embd, "max_seq_len"):
+                        decoder.rotary_embd.max_seq_len = vlm_cfg.lm_max_position_embeddings
+                    if hasattr(vlm_cfg, "lm_max_position_embeddings") and hasattr(decoder.rotary_embd, "original_max_seq_len"):
+                        decoder.rotary_embd.original_max_seq_len = vlm_cfg.lm_max_position_embeddings
+
         # In case model has sample length or tokenizer max length to override
         if hasattr(model, "max_sample_length") and hasattr(train_cfg, "max_sample_length"):
             model.max_sample_length = train_cfg.max_sample_length
@@ -366,36 +488,81 @@ def train(train_cfg, vlm_cfg):
             model.tokenizer.model_max_length = train_cfg.max_sample_length
 
     else:
-        model = VisionLanguageModel(vlm_cfg, load_backbone=vlm_cfg.vlm_load_backbone_weights)
+        if model_mode == "dualtower":
+            model = DualTowerVLM(vlm_cfg, load_backbone=vlm_cfg.vlm_load_backbone_weights)
+        else:
+            model = VisionLanguageModel(vlm_cfg, load_backbone=vlm_cfg.vlm_load_backbone_weights)
     
     if is_master():
-        print(f"nanoVLM initialized with {sum(p.numel() for p in model.parameters()):,} parameters") 
-        print(f"Training summary{' (global)' if is_dist() else ''}: {-1*get_world_size()} samples, batch size {int(train_cfg.batch_size*get_world_size()*train_cfg.gradient_accumulation_steps)}{', training on ' + str(get_world_size()) + ' GPUs' if is_dist() else ''}")
+        model_label = "DualTowerVLM" if model_mode == "dualtower" else "nanoVLM"
+        total_params = sum(p.numel() for p in model.parameters())
+        log_info(
+            f"{ctext(model_label, 'cyan', attrs=('bold',))} initialized with "
+            f"{ctext(f'{total_params:,}', 'cyan', attrs=('bold',))} parameters"
+        )
+        log_info(
+            f"Training summary{' (global)' if is_dist() else ''}: "
+            f"batch size {ctext(int(train_cfg.batch_size*get_world_size()*train_cfg.gradient_accumulation_steps), 'cyan', attrs=('bold',))}"
+            f"{', training on ' + str(get_world_size()) + ' GPUs' if is_dist() else ''}"
+        )
         if is_dist():
-            print(f"Training summary per GPU: batch size {train_loader.batch_size}")
-        print(f"Validation summary{' (global)' if is_dist() else ''}: {-1*get_world_size()} samples, batch size {int(train_cfg.batch_size*get_world_size()*train_cfg.gradient_accumulation_steps)}{', training on ' + str(get_world_size()) + ' GPUs' if is_dist() else ''}")
+            log_info(f"Training summary per GPU: batch size {ctext(train_loader.batch_size, 'cyan', attrs=('bold',))}")
+        log_info(
+            f"Validation summary{' (global)' if is_dist() else ''}: "
+            f"batch size {ctext(int(train_cfg.batch_size*get_world_size()*train_cfg.gradient_accumulation_steps), 'cyan', attrs=('bold',))}"
+            f"{', training on ' + str(get_world_size()) + ' GPUs' if is_dist() else ''}"
+        )
         if is_dist():
-            print(f"Validation summary per GPU: batch size {val_loader.batch_size}")
+            log_info(f"Validation summary per GPU: batch size {ctext(val_loader.batch_size, 'cyan', attrs=('bold',))}")
 
     # Define optimizer groups
     # Since we have pretrained vision and language backbones, but a newly initialized modality projection layer, it doesn't make sense to train them with the same learning rate
     # You could opt to fully freeze the backbones and only train the MP layer, but finetuning them with a lower learning rate makes the training as a whole easier
     param_groups = []
+    dual_left_lr = (
+        train_cfg.lr_left_tower
+        if train_cfg.lr_left_tower is not None
+        else train_cfg.lr_language_backbone
+    )
+    dual_right_lr = (
+        train_cfg.lr_right_tower
+        if train_cfg.lr_right_tower is not None
+        else train_cfg.lr_language_backbone
+    )
+
+    mp_module = model.left_tower.MP if model_mode == "dualtower" and hasattr(model, "left_tower") else model.MP
+    vision_module = model.left_tower.vision_encoder if model_mode == "dualtower" and hasattr(model, "left_tower") else model.vision_encoder
+
     if train_cfg.lr_mp > 0:
-        param_groups.append({'params': list(model.MP.parameters()), 'lr': train_cfg.lr_mp})
+        param_groups.append({'name': 'lr_mp', 'params': list(mp_module.parameters()), 'lr': train_cfg.lr_mp})
     else:
-        for p in list(model.MP.parameters()):
+        for p in list(mp_module.parameters()):
             p.requires_grad = False
+
     if train_cfg.lr_vision_backbone > 0:
-        param_groups.append({'params': list(model.vision_encoder.parameters()), 'lr': train_cfg.lr_vision_backbone})
+        param_groups.append({'name': 'lr_vision_backbone', 'params': list(vision_module.parameters()), 'lr': train_cfg.lr_vision_backbone})
     else:
-        for p in list(model.vision_encoder.parameters()):
+        for p in list(vision_module.parameters()):
             p.requires_grad = False
-    if train_cfg.lr_language_backbone > 0:
-        param_groups.append({'params': list(model.decoder.parameters()), 'lr': train_cfg.lr_language_backbone})
+
+    if model_mode == "dualtower" and hasattr(model, "left_tower") and hasattr(model, "right_tower"):
+        if dual_left_lr > 0:
+            param_groups.append({'name': 'lr_left_tower', 'params': list(model.left_tower.decoder.parameters()), 'lr': dual_left_lr})
+        else:
+            for p in list(model.left_tower.decoder.parameters()):
+                p.requires_grad = False
+
+        if dual_right_lr > 0:
+            param_groups.append({'name': 'lr_right_tower', 'params': list(model.right_tower.parameters()), 'lr': dual_right_lr})
+        else:
+            for p in list(model.right_tower.parameters()):
+                p.requires_grad = False
     else:
-        for p in list(model.decoder.parameters()):
-            p.requires_grad = False
+        if train_cfg.lr_language_backbone > 0:
+            param_groups.append({'name': 'lr_language_backbone', 'params': list(model.decoder.parameters()), 'lr': train_cfg.lr_language_backbone})
+        else:
+            for p in list(model.decoder.parameters()):
+                p.requires_grad = False
 
     optimizer = optim.AdamW(param_groups)
     all_params = [p for group in optimizer.param_groups for p in group['params']]
@@ -409,15 +576,15 @@ def train(train_cfg, vlm_cfg):
         torch.backends.mps.enable_fallback_to_cpu = True
         torch.mps.empty_cache()
     
-    print(f"Using device: {device}")
+    log_info(f"Using device: {ctext(device, 'cyan', attrs=('bold',))}")
     model.to(device)
     
     if train_cfg.compile:
         model = torch.compile(model)
     if is_dist():
-        print("Wrapping model for DDP")
+        log_info("Wrapping model for DDP")
         model = wrap_model(model)
-        print("Model wrapped for DDP")
+        log_success("Model wrapped for DDP")
 
     epoch_times = []
     best_val_loss = float('inf')
@@ -451,7 +618,7 @@ def train(train_cfg, vlm_cfg):
         accumulated_effective_ratio_count = torch.zeros((), device=device, dtype=torch.float32)
         data_load_start = time.time()
 
-        print("Starting training loop")
+        log_info(f"Starting training loop for epoch {ctext(epoch, 'cyan', attrs=('bold',))}")
         remaining_steps = train_cfg.max_training_steps - global_step
         step_progress = tqdm(
             total=remaining_steps,
@@ -545,20 +712,30 @@ def train(train_cfg, vlm_cfg):
                     if is_dist():
                         grad_norm_value = dist_mean_scalar(grad_norm_value)
 
-                param_group_idx = 0
-                if train_cfg.lr_mp > 0:
-                    adj_lr_mp = get_lr(step_after_update, train_cfg.lr_mp, train_cfg.max_training_steps)
-                    optimizer.param_groups[param_group_idx]['lr'] = adj_lr_mp
-                    param_group_idx += 1
+                for group in optimizer.param_groups:
+                    group_name = group.get("name")
+                    max_lr = None
+                    if group_name == "lr_mp":
+                        max_lr = train_cfg.lr_mp
+                    elif group_name == "lr_vision_backbone":
+                        max_lr = train_cfg.lr_vision_backbone
+                    elif group_name == "lr_language_backbone":
+                        max_lr = train_cfg.lr_language_backbone
+                    elif group_name == "lr_left_tower":
+                        max_lr = (
+                            train_cfg.lr_left_tower
+                            if train_cfg.lr_left_tower is not None
+                            else train_cfg.lr_language_backbone
+                        )
+                    elif group_name == "lr_right_tower":
+                        max_lr = (
+                            train_cfg.lr_right_tower
+                            if train_cfg.lr_right_tower is not None
+                            else train_cfg.lr_language_backbone
+                        )
 
-                if train_cfg.lr_vision_backbone > 0:
-                    adj_lr_vision_backbone = get_lr(step_after_update, train_cfg.lr_vision_backbone, train_cfg.max_training_steps)
-                    optimizer.param_groups[param_group_idx]['lr'] = adj_lr_vision_backbone
-                    param_group_idx += 1
-
-                if train_cfg.lr_language_backbone > 0:
-                    adj_lr_language_backbone = get_lr(step_after_update, train_cfg.lr_language_backbone, train_cfg.max_training_steps)
-                    optimizer.param_groups[param_group_idx]['lr'] = adj_lr_language_backbone
+                    if max_lr is not None and max_lr > 0:
+                        group['lr'] = get_lr(step_after_update, max_lr, train_cfg.max_training_steps)
               
                 optimizer.step()
                 optimizer.zero_grad()
@@ -595,7 +772,10 @@ def train(train_cfg, vlm_cfg):
                 and is_update_step
                 and step_after_update % train_cfg.eval_interval == 0
             ):
-                print("Starting evaluation")
+                log_info(
+                    f"Starting evaluation at step "
+                    f"{progress_color(step_after_update, train_cfg.max_training_steps)}"
+                )
                 model.eval()
                 if device.type == "cuda":
                     torch.cuda.empty_cache()
@@ -603,9 +783,11 @@ def train(train_cfg, vlm_cfg):
                     total_val_loss = 0
                     total_val_tokens = 0
                     val_batches = 0
+                    should_log_val_decode = (step_after_update % VAL_DEBUG_SAMPLE_INTERVAL == 0)
+                    logged_val_decode = False
                     for batch in synchronized_dataloader_step(iter_val_loader, is_dist()):
                         if val_batches > 1000:
-                            print(f"Evaluated {val_batches} batches")
+                            log_info(f"Evaluated {ctext(val_batches, 'cyan', attrs=('bold',))} validation batches")
                             break
                         images = batch["images"]
                         input_ids = batch["input_ids"].to(device)
@@ -613,7 +795,7 @@ def train(train_cfg, vlm_cfg):
                         attention_mask = batch["attention_mask"].to(device)
 
                         with autocast_context:
-                            _, loss, loss_token_count = model(
+                            logits, loss, loss_token_count = model(
                                 input_ids,
                                 images,
                                 attention_mask=attention_mask,
@@ -621,6 +803,18 @@ def train(train_cfg, vlm_cfg):
                                 loss_reduction="sum",
                                 return_loss_count=True,
                             )
+
+                        if is_master() and should_log_val_decode and not logged_val_decode:
+                            preview = _build_decode_preview(model, logits, labels)
+                            if preview is not None:
+                                pred_text, target_text = preview
+                                _log_pred_vs_target(
+                                    step_after_update,
+                                    pred_text,
+                                    target_text,
+                                    tag="val-debug",
+                                )
+                                logged_val_decode = True
 
                         total_val_loss += loss.item()
                         total_val_tokens += int(loss_token_count.item())
@@ -644,10 +838,10 @@ def train(train_cfg, vlm_cfg):
                         best_checkpoint_repo_id = checkpoint_repo_by_step.get(step_after_update)
                     
                     if is_master():
-                        print(
-                            f"[VAL] step={step_after_update} "
-                            f"val_loss={avg_val_loss:.4f} "
-                            f"tokens_per_second={tokens_per_second:.2f}"
+                        log_info(
+                            f"Validation {progress_color(step_after_update, train_cfg.max_training_steps)} | "
+                            f"Val Loss: {ctext(f'{avg_val_loss:.4f}', 'yellow', attrs=('bold',))} | "
+                            f"Tokens/s: {ctext(f'{tokens_per_second:.2f}', 'yellow', attrs=('bold',))}"
                         )
                         if train_cfg.log_wandb:
                             run.log({"val_loss": avg_val_loss}, step=step_after_update)
@@ -665,11 +859,14 @@ def train(train_cfg, vlm_cfg):
                     i=step_after_update,
                 )
                 save_model = model.module if is_dist() else model
-                print(f"[CKPT] Pushing checkpoint for step {step_after_update} to {checkpoint_repo_id}")
+                log_info(
+                    f"Pushing checkpoint for step "
+                    f"{progress_color(step_after_update, train_cfg.max_training_steps)} "
+                    f"to {ctext(checkpoint_repo_id, 'cyan')}"
+                )
                 save_model.push_to_hub(
                     checkpoint_repo_id,
                     private=train_cfg.hf_private,
-                    commit_message=f"Upload checkpoint at step {step_after_update}",
                 )
                 checkpoint_repo_by_step[step_after_update] = checkpoint_repo_id
                 if best_val_step == step_after_update:
@@ -726,7 +923,7 @@ def train(train_cfg, vlm_cfg):
                         if step_effective_token_ratio_value is not None
                         else batch_effective_token_ratio
                     )
-                    print(
+                    log_info(
                         f"[TRAIN] step={step_after_update} "
                         f"batch_loss={batch_loss:.4f} "
                         f"step_loss={update_loss_text:.4f} "
@@ -735,6 +932,8 @@ def train(train_cfg, vlm_cfg):
                         f"lr_mp={stats.get('lr_mp', 0.0):.6g} "
                         f"lr_vision={stats.get('lr_vision_backbone', 0.0):.6g} "
                         f"lr_lm={stats.get('lr_language_backbone', 0.0):.6g} "
+                        f"lr_left={stats.get('lr_left_tower', 0.0):.6g} "
+                        f"lr_right={stats.get('lr_right_tower', 0.0):.6g} "
                         + (f"grad_norm={stats['grad_norm']:.4f}" if 'grad_norm' in stats else "")
                     )
                 
@@ -809,7 +1008,13 @@ def train(train_cfg, vlm_cfg):
                          "train/epoch_duration": epoch_duration,
                          "train/epoch_tokens_per_second": epoch_tokens_per_second})
 
-            print(f"Epoch: {epoch}, Step: {global_step}/{train_cfg.max_training_steps}, Train Loss: {avg_train_loss:.4f} | Time: {epoch_duration:.2f}s | T/s: {epoch_tokens_per_second:.2f}")
+            log_info(
+                f"Epoch {ctext(epoch, 'cyan', attrs=('bold',))} | "
+                f"Step {progress_color(global_step, train_cfg.max_training_steps)} | "
+                f"Train Loss: {ctext(f'{avg_train_loss:.4f}', 'yellow', attrs=('bold',))} | "
+                f"Time: {epoch_duration:.2f}s | "
+                f"T/s: {ctext(f'{epoch_tokens_per_second:.2f}', 'yellow', attrs=('bold',))}"
+            )
 
     # Summary Statistics
     if is_master():
@@ -818,23 +1023,22 @@ def train(train_cfg, vlm_cfg):
         batch_size = int(train_cfg.batch_size*get_world_size()*train_cfg.gradient_accumulation_steps)
         total_samples_processed = batch_size * global_step
         avg_time_per_sample = total_training_time / total_samples_processed
-        print(f"Average time per epoch: {avg_epoch_time:.2f}s")
-        print(f"Average time per sample: {avg_time_per_sample:.4f}s")
+        log_success(f"Average time per epoch: {ctext(f'{avg_epoch_time:.2f}s', 'cyan', attrs=('bold',))}")
+        log_success(f"Average time per sample: {ctext(f'{avg_time_per_sample:.4f}s', 'cyan', attrs=('bold',))}")
         if best_val_step is not None:
-            print(
+            log_success(
                 f"Best validation loss {best_val_loss:.4f} observed at step {best_val_step}"
                 + (f" ({best_checkpoint_repo_id})" if best_checkpoint_repo_id is not None else "")
             )
         else:
-            print("No validation pass was run during training.")
+            log_warn("No validation pass was run during training.")
 
         if train_cfg.push_final_model_to_hub and vlm_cfg.hf_repo_name is not None:
             save_model = model.module if is_dist() else model
-            print(f"Pushing final model to Hugging Face Hub repo {vlm_cfg.hf_repo_name}")
+            log_info(f"Pushing final model to Hugging Face Hub repo {ctext(vlm_cfg.hf_repo_name, 'cyan')}")
             save_model.push_to_hub(
                 vlm_cfg.hf_repo_name,
                 private=train_cfg.hf_private,
-                commit_message=f"Upload final model from run {run_name}",
             )
 
         if train_cfg.log_wandb:
@@ -852,6 +1056,8 @@ def main():
     parser.add_argument('--lr_mp', type=float, help='Learning rate for the mapping network')
     parser.add_argument('--lr_vision_backbone', type=float, help='Learning rate for the vision backbone')
     parser.add_argument('--lr_language_backbone', type=float, help='Learning rate for the language backbone')
+    parser.add_argument('--lr_left_tower', type=float, help='DualTower: learning rate for the left tower language decoder')
+    parser.add_argument('--lr_right_tower', type=float, help='DualTower: learning rate for the right tower')
     parser.add_argument('--vlm_checkpoint_path', type=str, help='Path or repo ID of the VLM checkpoint for loading')
     parser.add_argument('--compile', type=bool, help='Use torch.compile to optimize the model')
     parser.add_argument('--log_wandb', type=bool, help='Log to wandb')
@@ -869,6 +1075,9 @@ def main():
     parser.add_argument('--image_correspondence_min_rating', type=int, help='Minimum image correspondence rating of images per sample')
     parser.add_argument('--visual_dependency_min_rating', type=int, help='Minimum visual dependency rating of images per sample')
     parser.add_argument('--formatting_min_rating', type=int, help='Minimum formatting rating of images per sample')
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument('--dualtower', action='store_true', help='Use DualTowerVLM architecture')
+    mode_group.add_argument('--nanovlm', action='store_true', help='Use nanoVLM architecture (default)')
 
     args = parser.parse_args()
 
@@ -881,6 +1090,10 @@ def main():
         train_cfg.lr_vision_backbone = args.lr_vision_backbone
     if args.lr_language_backbone is not None:
         train_cfg.lr_language_backbone = args.lr_language_backbone
+    if args.lr_left_tower is not None:
+        train_cfg.lr_left_tower = args.lr_left_tower
+    if args.lr_right_tower is not None:
+        train_cfg.lr_right_tower = args.lr_right_tower
     if args.vlm_checkpoint_path is not None:
         vlm_cfg.vlm_checkpoint_path = args.vlm_checkpoint_path
     if args.compile is not None:
@@ -914,6 +1127,10 @@ def main():
     if args.formatting_min_rating is not None:
         train_cfg.formatting_min_rating = args.formatting_min_rating
 
+    model_mode = "dualtower" if args.dualtower else "nanovlm"
+    if args.nanovlm:
+        model_mode = "nanovlm"
+
     if args.resume_from_vlm_checkpoint and args.vlm_checkpoint_path is not None:
         train_cfg.resume_from_vlm_checkpoint = True
         # When resuming a full VLM, we don't need to load individual backbone weights from original sources
@@ -924,12 +1141,14 @@ def main():
         PG_CPU = dist.new_group(backend="gloo")   # host‑RAM, zero GPU allocations
 
     if is_master():
-        print("--- VLM Config ---")
-        print(vlm_cfg)
-        print("--- Train Config ---")
-        print(train_cfg)
+        log_info(ctext("--- Mode ---", "cyan", attrs=("bold",)))
+        print(ctext(model_mode, "cyan", attrs=("bold",)))
+        log_info(ctext("--- VLM Config ---", "cyan", attrs=("bold",)))
+        print(ctext(vlm_cfg, "white"))
+        log_info(ctext("--- Train Config ---", "cyan", attrs=("bold",)))
+        print(ctext(train_cfg, "white"))
 
-    train(train_cfg, vlm_cfg)
+    train(train_cfg, vlm_cfg, model_mode=model_mode)
 
     if is_dist():
         destroy_dist()

@@ -87,6 +87,19 @@ python train.py
 ```
 which will use the default `models/config.py`.
 
+To explicitly select architecture mode:
+```bash
+python train.py --nanovlm    # default mode
+python train.py --dualtower  # use DualTowerVLM
+```
+
+For DualTower, you can explicitly set separate left/right tower learning rates:
+```bash
+python train.py --dualtower --lr_left_tower 1e-5 --lr_right_tower 5e-6
+```
+When resuming DualTower from `--vlm_checkpoint_path`, training initializes the right tower from `lm_model_type` (fresh HF LM init) and does not copy vanilla `decoder.*` checkpoint weights into the right tower.
+`DualTowerVLM.from_pretrained(...)` now performs strict dualtower checkpoint loading (`model.safetensors` + `config.json`) without automatic key remapping from vanilla nanoVLM checkpoints. For vanilla-to-dualtower initialization, use `--resume_from_vlm_checkpoint` in training.
+
 `train.py` computes loss with `loss_reduction="sum"` and normalizes updates/metrics by the number of valid target tokens (`labels != -100`) across gradient accumulation (and across all ranks in DDP).
 When logging, `train/batch_loss` is the current microbatch token-normalized loss, and `train/step_loss` is the token-normalized loss used for the optimizer step.
 It also logs `effective_token_ratio_per_instance = mean_i(valid_target_tokens_i / attention_tokens_i)` for training.
@@ -100,6 +113,10 @@ python generate.py
 or, to use your own trained model, you can simply run:
 ```bash
 python generate.py --checkpoint /your/path/to/trained_models
+```
+For DualTower checkpoints/repos, select mode explicitly:
+```bash
+python generate.py --mode dualtower --checkpoint /your/path/to/dualtower_checkpoint
 ```
 
 If we feed the example image in `assets/image.png` with a question into the model, we get the following output. Even after only short training, the model can recognize the cat in the picture. 
@@ -128,7 +145,10 @@ export HF_HOME="<Path to HF cache>"
 huggingface-cli login
 
 # Evaluate a trained model on multiple benchmarks
-python evaluation.py --model lusxvr/nanoVLM-450M --tasks mmstar,mme
+python evaluation.py --mode nanovlm --model lusxvr/nanoVLM-450M --tasks mmstar,mme
+
+# Evaluate a DualTower checkpoint/repo
+python evaluation.py --mode dualtower --model <dualtower-repo-or-checkpoint-path> --tasks mmstar,mme
 
 # If you want to use it during training, simply import the module and call it just as you would from the command line.
 # You can pass all the arguments you can also pass in the command line.

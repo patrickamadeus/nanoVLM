@@ -6,6 +6,7 @@ torch.manual_seed(0)
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(0)
 
+from models.dual_tower.dual_tower import DualTowerVLM
 from models.vision_language_model import VisionLanguageModel
 from data.processors import get_tokenizer, get_image_processor, get_image_string
 
@@ -13,6 +14,10 @@ from data.processors import get_tokenizer, get_image_processor, get_image_string
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Generate text from an image with nanoVLM")
+    parser.add_argument(
+        "--mode", type=str, choices=["nanovlm", "dualtower"], default="nanovlm",
+        help="Model architecture mode. Use 'dualtower' for DualTowerVLM checkpoints."
+    )
     parser.add_argument(
         "--checkpoint", type=str, default=None,
         help="Path to a local checkpoint (directory or safetensors/pth). If omitted, we pull from HF."
@@ -50,8 +55,11 @@ def main():
     
     if args.measure_vram and torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats(device)
-    
-    model = VisionLanguageModel.from_pretrained(source).to(device)
+
+    if args.mode == "dualtower":
+        model = DualTowerVLM.from_pretrained(source, device=device).to(device)
+    else:
+        model = VisionLanguageModel.from_pretrained(source).to(device)
     model.eval()
     
     if args.measure_vram and torch.cuda.is_available():

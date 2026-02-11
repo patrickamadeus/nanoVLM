@@ -9,6 +9,7 @@ import torch.distributed as dist
 from pathlib import Path
 from typing import List, Optional, Dict, Set, Tuple
 from models.vision_language_model import VisionLanguageModel
+from models.dual_tower.dual_tower import DualTowerVLM
 
 from torch.nn.parallel import DistributedDataParallel
 
@@ -41,15 +42,19 @@ def dist_gather(o):
 def wrap_model(model):
     return DistributedDataParallel(model, device_ids=[dist.get_rank()])
 
-def run_evaluation(checkpoint_path, global_step, tasks, limit, batch_size):
+def run_evaluation(checkpoint_path, global_step, tasks, limit, batch_size, mode="nanovlm"):
     from evaluation import cli_evaluate
-    model = VisionLanguageModel.from_pretrained(checkpoint_path)
+    if mode == "dualtower":
+        model = DualTowerVLM.from_pretrained(checkpoint_path)
+    else:
+        model = VisionLanguageModel.from_pretrained(checkpoint_path)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model.to(device)
     model.eval()
 
     print("Running lmms-eval...")
     eval_args = argparse.Namespace(
+        mode=mode,
         model=model,
         tasks=tasks,
         limit=limit,
@@ -257,7 +262,8 @@ def orchestrate_evaluations(
     specific_steps: Optional[List[int]] = None,
     limit: Optional[int] = None,
     batch_size: int = 128,
-    force: bool = False
+    force: bool = False,
+    mode: str = "nanovlm",
 ) -> None:
     """
     Main orchestration function for running evaluations.
@@ -345,7 +351,7 @@ def orchestrate_evaluations(
         
         try:
             # Run evaluation for tasks
-            results = run_evaluation(checkpoint_path, step, tasks_to_run, limit, batch_size)
+            results = run_evaluation(checkpoint_path, step, tasks_to_run, limit, batch_size, mode=mode)
             print(f"✓ Completed evaluation for step {step}, Rank: {get_rank()}")
 
             # Save results
@@ -370,6 +376,7 @@ def main():
     parser.add_argument("--limit", type=int, help="Limit number of examples per task")
     parser.add_argument("--batch_size", type=int, default=64, help="Batch size for evaluation")
     parser.add_argument("--force", action="store_true", help="Force re-run evaluations, ignoring existing results")
+    parser.add_argument("--mode", type=str, default="nanovlm", choices=["nanovlm", "dualtower"], help="Evaluation model mode")
 
     args = parser.parse_args()
 
@@ -385,7 +392,8 @@ def main():
         specific_steps=args.steps,
         limit=args.limit,
         batch_size=args.batch_size,
-        force=args.force
+        force=args.force,
+        mode=args.mode,
     )
 
     end_time = time.time()

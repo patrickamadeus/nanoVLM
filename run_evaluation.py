@@ -3,10 +3,12 @@ import os
 import json
 import torch
 from models.vision_language_model import VisionLanguageModel
+from models.dual_tower.dual_tower import DualTowerVLM
 import models.config as config
 
 def main():
     parser = argparse.ArgumentParser(description="Run lmms-eval on a model checkpoint.")
+    parser.add_argument('--mode', type=str, default='nanovlm', choices=['nanovlm', 'dualtower'], help='Evaluation model mode.')
     parser.add_argument('--checkpoint_path', type=str, help="Path to the model checkpoint directory.")
     parser.add_argument('--global_step', type=int, help="Global step at which the checkpoint was saved.")
     parser.add_argument('--run_name', type=str, help="The name of the training run.")
@@ -19,13 +21,17 @@ def main():
     args = parser.parse_args()
 
     from evaluation import cli_evaluate
-    model = VisionLanguageModel.from_pretrained(args.checkpoint_path)
+    if args.mode == "dualtower":
+        model = DualTowerVLM.from_pretrained(args.checkpoint_path)
+    else:
+        model = VisionLanguageModel.from_pretrained(args.checkpoint_path)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model.to(device)
     model.eval()
 
     print("Running lmms-eval...")
     eval_args = argparse.Namespace(
+        mode=args.mode,
         model=model,
         tasks=args.tasks,
         limit=args.limit,
