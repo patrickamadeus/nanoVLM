@@ -113,6 +113,17 @@ To prefix generated W&B run names while keeping the default naming scheme, set `
 To set the W&B project from config, set `train.wandb_project` (for example: `wandb_project: "my-project"`).
 To enable Mixture of Modality Heads (MoMH) attention, set `vlm.momh_enabled: true` in config (disabled by default). You can tune head allocation with `vlm.momh_head_pct_vision` and `vlm.momh_head_pct_text`.
 For quick CLI debugging, you can also pass `--momh_enabled True`.
+To validate MoMH masking behavior quickly, use:
+```bash
+source .venv/bin/activate
+python eval/check_momh_mask.py --mode synthetic
+```
+To run checks on a real training batch from your config:
+```bash
+source .venv/bin/activate
+python eval/check_momh_mask.py --mode dataloader --config configs/train.small_debug.momh.yaml
+```
+`cross_segment_allowed_count > 0` means packed samples are not segment-isolated by current masking.
 
 To explicitly select architecture mode:
 ```bash

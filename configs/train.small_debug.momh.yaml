@@ -147,7 +147,7 @@ train:
   formatting_min_rating: 1
   wandb_entity: patrickirawan-mbzuai
   wandb_project: "dualtower-debug"
-  wandb_run_name_prefix: "debugmomh"
+  wandb_run_name_prefix: "debug"
   log_wandb: true
   use_lmms_eval: false
   lmms_eval_tasks: mmstar,mmmu_val,ocrbench,textvqa_val,docvqa_val,scienceqa,mme,infovqa_val,chartqa
