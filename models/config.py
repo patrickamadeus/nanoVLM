@@ -36,6 +36,9 @@ class VLMConfig:
 
     mp_pixel_shuffle_factor: int = 4
     mp_image_token_length: int = 64
+    momh_enabled: bool = False
+    momh_head_pct_vision: float = 0.2  # 20% heads for V->V
+    momh_head_pct_text: float = 0.3  # 30% heads for T->T
 
     max_img_size: int = 2048
     resize_to_max_side_len: bool = False

@@ -1100,6 +1100,7 @@ def main():
             "--lr_right_tower",
             "--vlm_checkpoint_path",
             "--left_tower_mask_mode",
+            "--momh_enabled",
             "--compile",
             "--log_wandb",
             "--resume_from_vlm_checkpoint",
@@ -1145,6 +1146,7 @@ def main():
         choices=['visual_only', 'visual_plus_prefix', 'full'],
         help='DualTower left-tower mask mode: visual_only, visual_plus_prefix, or full',
     )
+    parser.add_argument('--momh_enabled', type=bool, help='Enable MoMH attention')
     parser.add_argument('--compile', type=bool, help='Use torch.compile to optimize the model')
     parser.add_argument('--log_wandb', type=bool, help='Log to wandb')
     parser.add_argument('--resume_from_vlm_checkpoint', type=bool, default=False, help='Resume training from VLM checkpoint specified by vlm_checkpoint_path (or default if not provided)')
@@ -1210,6 +1212,8 @@ def main():
             vlm_cfg.vlm_checkpoint_path = args.vlm_checkpoint_path
         if args.left_tower_mask_mode is not None:
             vlm_cfg.left_tower_mask_mode = args.left_tower_mask_mode
+        if args.momh_enabled is not None:
+            vlm_cfg.momh_enabled = args.momh_enabled
         if args.compile is not None:
             train_cfg.compile = args.compile
         if args.log_wandb is not None:
@@ -1249,6 +1253,8 @@ def main():
         vlm_cfg.vlm_checkpoint_path = args.vlm_checkpoint_path
     if args.left_tower_mask_mode is not None:
         vlm_cfg.left_tower_mask_mode = args.left_tower_mask_mode
+    if args.momh_enabled is not None:
+        vlm_cfg.momh_enabled = args.momh_enabled
     if args.resume_from_vlm_checkpoint:
         train_cfg.resume_from_vlm_checkpoint = True
     if args.checkpoint_interval is not None:

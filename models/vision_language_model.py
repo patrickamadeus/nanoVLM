@@ -9,6 +9,7 @@ from models.utils import top_k_top_p_filtering
 from models.vision_transformer import ViT
 from models.language_model import LanguageModel
 from models.modality_projector import ModalityProjector
+from models.momh_attention import create_momh_block_mask_from_modality
 from models.config import VLMConfig
 
 from data.processors import get_tokenizer
@@ -32,6 +33,8 @@ class VisionLanguageModel(nn.Module):
         self.MP = ModalityProjector(cfg)
         self.load_backbone = load_backbone
         self.tokenizer = get_tokenizer(cfg.lm_tokenizer, cfg.vlm_extra_tokens, cfg.lm_chat_template)
+        self.image_token_id = int(self.tokenizer.image_token_id)
+        self.eos_token_id = getattr(self.tokenizer, "eos_token_id", None)
 
     def _replace_img_tokens_with_embd(self, input_ids, token_embd, image_embd):
         """
@@ -43,7 +46,7 @@ class VisionLanguageModel(nn.Module):
         updated_token_embd = token_embd.clone()
 
         # Build a mask of all image-token positions: shape [B, T_seq]
-        mask = (input_ids == self.tokenizer.image_token_id)
+        mask = (input_ids == self.image_token_id)
         updated_token_embd[mask] = image_embd.view(-1, image_embd.size(-1)).to(updated_token_embd.dtype) # torch flattens before assigning
 
         return updated_token_embd
@@ -89,14 +92,42 @@ class VisionLanguageModel(nn.Module):
         return_loss_count: bool = False,
     ):
         images_tensor = self._process_images(images, input_ids.device)
+        is_vision = (input_ids == self.image_token_id)
         token_embd = self.decoder.token_embedding(input_ids) # [B, T_sequence, D_lm]
+
+        prefill_block_mask = None
+        if (
+            attention_mask is not None
+            and input_ids.device.type == "cuda"
+            and hasattr(self.decoder, "blocks")
+            and len(self.decoder.blocks) > 0
+            and self.decoder.blocks[0].attn.momh_enabled
+            and input_ids.size(1) > 1
+        ):
+            seq_len = int(input_ids.size(1))
+            prefill_block_mask = create_momh_block_mask_from_modality(
+                n_q_heads=int(self.decoder.blocks[0].attn.n_heads),
+                q_len=seq_len,
+                kv_len=seq_len,
+                is_vision=is_vision[:, :seq_len],
+                attention_mask=attention_mask[:, :seq_len],
+                pct_v=float(self.decoder.blocks[0].attn.momh_pct_vision),
+                pct_t=float(self.decoder.blocks[0].attn.momh_pct_text),
+                device=str(input_ids.device),
+            )
 
         if images_tensor is not None:
             image_embd = self.vision_encoder(images_tensor)
             image_embd = self.MP(image_embd)  # [num_images, mp_image_token_length, D_lm]
             token_embd = self._replace_img_tokens_with_embd(input_ids, token_embd, image_embd)
 
-        logits, _ = self.decoder(token_embd, attention_mask=attention_mask)
+        logits, _ = self.decoder(
+            token_embd,
+            attention_mask=attention_mask,
+            content_starts=None,
+            is_vision=is_vision,
+            prefill_block_mask=prefill_block_mask,
+        )
 
         loss = None
         loss_count = None
@@ -124,7 +155,29 @@ class VisionLanguageModel(nn.Module):
     @torch.inference_mode()
     def generate(self, input_ids, images, attention_mask=None, max_new_tokens=5, top_k=50, top_p=0.9, temperature=0.5, greedy=False):
         images_tensor = self._process_images(images, input_ids.device)
+        is_vision = (input_ids == self.image_token_id)
         token_embd = self.decoder.token_embedding(input_ids) # [B, T_prompt_text, D_lm]
+
+        prefill_block_mask = None
+        if (
+            attention_mask is not None
+            and input_ids.device.type == "cuda"
+            and hasattr(self.decoder, "blocks")
+            and len(self.decoder.blocks) > 0
+            and self.decoder.blocks[0].attn.momh_enabled
+            and input_ids.size(1) > 1
+        ):
+            seq_len = int(input_ids.size(1))
+            prefill_block_mask = create_momh_block_mask_from_modality(
+                n_q_heads=int(self.decoder.blocks[0].attn.n_heads),
+                q_len=seq_len,
+                kv_len=seq_len,
+                is_vision=is_vision[:, :seq_len],
+                attention_mask=attention_mask[:, :seq_len],
+                pct_v=float(self.decoder.blocks[0].attn.momh_pct_vision),
+                pct_t=float(self.decoder.blocks[0].attn.momh_pct_text),
+                device=str(input_ids.device),
+            )
 
         if images_tensor is not None:
             # 1. Process image if present
@@ -141,7 +194,10 @@ class VisionLanguageModel(nn.Module):
             token_embd,
             attention_mask=attention_mask, # Use the provided attention mask
             kv_cache=None,
-            start_pos=0
+            start_pos=0,
+            content_starts=None,
+            is_vision=is_vision,
+            prefill_block_mask=prefill_block_mask,
         )
         
         last_token_output_from_prefill = prefill_output[:, -1, :] 
@@ -175,13 +231,19 @@ class VisionLanguageModel(nn.Module):
             # update attention mask
             if attention_mask is not None:
                 attention_mask = torch.cat((attention_mask, torch.ones((batch_size, 1), device=attention_mask.device, dtype=attention_mask.dtype)), dim=1)
+            is_vision = torch.cat(
+                (is_vision, torch.zeros((batch_size, 1), device=is_vision.device, dtype=torch.bool)),
+                dim=1,
+            )
 
             # With KV cache: only process the new token
             decode_step_output, kv_cache_list = self.decoder(
                 next_token_embed,
                 attention_mask=attention_mask,
                 kv_cache=kv_cache_list,
-                start_pos=current_token_start_pos
+                start_pos=current_token_start_pos,
+                content_starts=None,
+                is_vision=is_vision,
             )
       
             last_token_output = decode_step_output[:, -1, :] 
@@ -198,11 +260,11 @@ class VisionLanguageModel(nn.Module):
         generated_ids = torch.cat(newly_generated_ids_list, dim=1)
 
         # Post-process to handle EOS token.
-        if self.tokenizer.eos_token_id is not None and generated_ids.numel() > 0: # Ensure generated_ids is not empty
+        if self.eos_token_id is not None and generated_ids.numel() > 0: # Ensure generated_ids is not empty
             seq_len = generated_ids.size(1)
             device = generated_ids.device
 
-            eos_mask = (generated_ids == self.tokenizer.eos_token_id) # Create a boolean mask for EOS tokens
+            eos_mask = (generated_ids == self.eos_token_id) # Create a boolean mask for EOS tokens
 
             col_indices_for_min = torch.arange(seq_len, device=device) # Create column indices [0, 1, ..., seq_len-1]
             
@@ -220,7 +282,7 @@ class VisionLanguageModel(nn.Module):
             # Tokens are replaced if their column index is greater than the index of the first EOS token
             replace_mask = col_indices_for_comparison > actual_first_eos_indices.unsqueeze(1)
             
-            generated_ids[replace_mask] = self.tokenizer.eos_token_id
+            generated_ids[replace_mask] = self.eos_token_id
         
         return generated_ids
 

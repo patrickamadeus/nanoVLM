@@ -111,6 +111,8 @@ python train.py --config configs/train.example.yaml
 When `--config` is set, only `--nanovlm` or `--dualtower` can override the config mode from CLI; other train overrides must be set in the YAML file.
 To prefix generated W&B run names while keeping the default naming scheme, set `train.wandb_run_name_prefix` in your config (for example: `wandb_run_name_prefix: "debug"`).
 To set the W&B project from config, set `train.wandb_project` (for example: `wandb_project: "my-project"`).
+To enable Mixture of Modality Heads (MoMH) attention, set `vlm.momh_enabled: true` in config (disabled by default). You can tune head allocation with `vlm.momh_head_pct_vision` and `vlm.momh_head_pct_text`.
+For quick CLI debugging, you can also pass `--momh_enabled True`.
 
 To explicitly select architecture mode:
 ```bash
