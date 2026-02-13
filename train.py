@@ -103,7 +103,7 @@ def dist_mean_scalar(x: float | int) -> float:
 
 def wrap_model(model):
     local_rank = int(os.environ["LOCAL_RANK"])
-    return DistributedDataParallel(model, device_ids=[local_rank], output_device=local_rank)
+    return DistributedDataParallel(model, device_ids=[local_rank], output_device=local_rank,find_unused_parameters=True)
 
 def get_run_name(train_cfg, vlm_cfg):
     batch_size = f"bs{int(train_cfg.batch_size*get_world_size()*train_cfg.gradient_accumulation_steps)}"
@@ -231,6 +231,7 @@ def get_dataloaders(train_cfg, vlm_cfg):
 
 
     if is_dist():  # We need to shard the dataset in DDP since we are using an iterable dataset instead of the distributed sampler
+        print("GET WORLD SIZE DIST", get_world_size())
         train_ds = train_ds.shard(num_shards=get_world_size(), index=get_rank())
         val_ds = val_ds.shard(num_shards=get_world_size(), index=get_rank())
 
@@ -291,7 +292,7 @@ def get_dataloaders(train_cfg, vlm_cfg):
         train_dataset,
         batch_size=train_cfg.batch_size,    # =per device BS in DDP
         collate_fn=vqa_collator,
-        num_workers=1,
+        num_workers=2,
         pin_memory=False,
         persistent_workers=False,
         drop_last=True,
@@ -303,7 +304,7 @@ def get_dataloaders(train_cfg, vlm_cfg):
         val_dataset,
         batch_size=train_cfg.batch_size,
         collate_fn=vqa_collator,
-        num_workers=1,
+        num_workers=2,
         pin_memory=False,
         persistent_workers=False,
         drop_last=True,
@@ -805,9 +806,10 @@ def train(train_cfg, vlm_cfg, model_mode: str = "nanovlm"):
                     val_batches = 0
                     should_log_val_decode = (step_after_update % VAL_DEBUG_SAMPLE_INTERVAL == 0)
                     logged_val_decode = False
+                    max_val_batches = 64  # Limit the number of batches to 64
+
                     for batch in synchronized_dataloader_step(iter_val_loader, is_dist()):
-                        if val_batches > 1000:
-                            log_info(f"Evaluated {ctext(val_batches, 'cyan', attrs=('bold',))} validation batches")
+                        if val_batches >= max_val_batches:
                             break
                         images = batch["images"]
                         input_ids = batch["input_ids"].to(device)

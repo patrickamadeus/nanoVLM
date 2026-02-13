@@ -40,7 +40,7 @@ def dist_gather(o):
     return o_all
 
 def wrap_model(model):
-    return DistributedDataParallel(model, device_ids=[dist.get_rank()])
+    return DistributedDataParallel(model, device_ids=[dist.get_rank()], find_unused_parameters=True)
 
 def run_evaluation(checkpoint_path, global_step, tasks, limit, batch_size, mode="nanovlm"):
     from evaluation import cli_evaluate
