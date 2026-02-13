@@ -509,6 +509,12 @@ def train(train_cfg, vlm_cfg, model_mode: str = "nanovlm"):
             },
             name=run_name,
         )
+        run.define_metric("train/consumed_tokens")
+        run.define_metric("train/*", step_metric="train/consumed_tokens")
+        run.define_metric("training_stats/*", step_metric="train/consumed_tokens")
+        run.define_metric("val_loss", step_metric="train/consumed_tokens")
+        run.define_metric("checkpoint/pushed", step_metric="train/consumed_tokens")
+        run.define_metric("grad_norm", step_metric="train/consumed_tokens")
 
     # Initialize model
     if train_cfg.resume_from_vlm_checkpoint:
@@ -696,6 +702,7 @@ def train(train_cfg, vlm_cfg, model_mode: str = "nanovlm"):
     best_checkpoint_repo_id = None
     checkpoint_repo_by_step = {}
     global_step = 0
+    global_consumed_tokens = 0
     epoch = 0
     
     # Training stats accumulators
@@ -720,6 +727,7 @@ def train(train_cfg, vlm_cfg, model_mode: str = "nanovlm"):
         accumulated_loss_tokens = torch.zeros((), device=device, dtype=torch.float32)
         accumulated_effective_ratio_sum = torch.zeros((), device=device, dtype=torch.float32)
         accumulated_effective_ratio_count = torch.zeros((), device=device, dtype=torch.float32)
+        accumulated_tokens_for_update_local = 0
         data_load_start = time.time()
 
         log_info(f"Starting training loop for epoch {ctext(epoch, 'cyan', attrs=('bold',))}")
@@ -862,6 +870,7 @@ def train(train_cfg, vlm_cfg, model_mode: str = "nanovlm"):
 
             num_tokens = torch.sum(attention_mask).item() # Sum of attention mask gives number of tokens
             total_tokens_processed += num_tokens
+            accumulated_tokens_for_update_local += num_tokens
             post_process_time = time.time() - post_process_start
 
             images_per_sample = [len(image_pack) for image_pack in images]
@@ -877,6 +886,20 @@ def train(train_cfg, vlm_cfg, model_mode: str = "nanovlm"):
             accumulated_stats['post_process_time'].append(post_process_time)
             accumulated_stats['images_per_sample'].extend(images_per_sample)
             accumulated_stats['effective_token_ratio_per_instance'].append(batch_effective_token_ratio)
+
+            if is_update_step:
+                if is_dist():
+                    update_tokens = torch.tensor(
+                        float(accumulated_tokens_for_update_local),
+                        device=device,
+                        dtype=torch.float64,
+                    )
+                    dist.all_reduce(update_tokens, op=dist.ReduceOp.SUM)
+                    update_tokens_global = int(update_tokens.item())
+                else:
+                    update_tokens_global = int(accumulated_tokens_for_update_local)
+                global_consumed_tokens += update_tokens_global
+                accumulated_tokens_for_update_local = 0
             
             if (
                 train_cfg.eval_in_epochs
@@ -956,7 +979,13 @@ def train(train_cfg, vlm_cfg, model_mode: str = "nanovlm"):
                             f"Tokens/s: {ctext(f'{tokens_per_second:.2f}', 'yellow', attrs=('bold',))}"
                         )
                         if train_cfg.log_wandb:
-                            run.log({"val_loss": avg_val_loss}, step=step_after_update)
+                            run.log(
+                                {
+                                    "val_loss": avg_val_loss,
+                                    "train/consumed_tokens": global_consumed_tokens,
+                                },
+                                step=step_after_update,
+                            )
 
                 model.train()
 
@@ -984,7 +1013,13 @@ def train(train_cfg, vlm_cfg, model_mode: str = "nanovlm"):
                 if best_val_step == step_after_update:
                     best_checkpoint_repo_id = checkpoint_repo_id
                 if train_cfg.log_wandb:
-                    run.log({"checkpoint/pushed": 1}, step=step_after_update)
+                    run.log(
+                        {
+                            "checkpoint/pushed": 1,
+                            "train/consumed_tokens": global_consumed_tokens,
+                        },
+                        step=step_after_update,
+                    )
 
             # Log training stats every N update steps (ALL RANKS must participate in collective ops)
             if (
@@ -1025,6 +1060,7 @@ def train(train_cfg, vlm_cfg, model_mode: str = "nanovlm"):
                 # MASTER ONLY: Log to wandb
                 if train_cfg.log_wandb and is_master():
                     run.log({
+                        "train/consumed_tokens": global_consumed_tokens,
                         **{f"training_stats/{key}": value for key, value in stats.items()},
                     }, step=step_after_update)
 
@@ -1078,6 +1114,7 @@ def train(train_cfg, vlm_cfg, model_mode: str = "nanovlm"):
                 # MASTER ONLY: Log to wandb
                 if train_cfg.log_wandb and is_master():
                     run.log({
+                        "train/consumed_tokens": global_consumed_tokens,
                         "train/batch_loss": microbatch_loss_gathered,
                         "train/step_loss": step_loss_gathered,
                         "train/batch_effective_token_ratio_per_instance": microbatch_effective_ratio_gathered,
@@ -1116,9 +1153,12 @@ def train(train_cfg, vlm_cfg, model_mode: str = "nanovlm"):
 
         if is_master():
             if train_cfg.log_wandb:
-                run.log({"train/epoch_loss": avg_train_loss,
-                         "train/epoch_duration": epoch_duration,
-                         "train/epoch_tokens_per_second": epoch_tokens_per_second})
+                run.log({
+                    "train/consumed_tokens": global_consumed_tokens,
+                    "train/epoch_loss": avg_train_loss,
+                    "train/epoch_duration": epoch_duration,
+                    "train/epoch_tokens_per_second": epoch_tokens_per_second,
+                })
 
             log_info(
                 f"Epoch {ctext(epoch, 'cyan', attrs=('bold',))} | "
@@ -1158,6 +1198,7 @@ def train(train_cfg, vlm_cfg, model_mode: str = "nanovlm"):
             run.summary["avg_time_per_sample"] = avg_time_per_sample
             run.summary["best_val_loss"] = best_val_loss if best_val_step is not None else None
             run.summary["best_val_step"] = best_val_step
+            run.summary["train/consumed_tokens"] = global_consumed_tokens
             if best_checkpoint_repo_id is not None:
                 run.summary["best_checkpoint_repo"] = best_checkpoint_repo_id
             run.finish()
