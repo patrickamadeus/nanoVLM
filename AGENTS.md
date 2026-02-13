@@ -9,13 +9,13 @@ This document defines the operational contract for AI agents working in this pro
 
 ## 1. Project Context
 
-**Purpose:** The goal is to use proper torch.compile since we are still doing very slow. Utilize compiled_resources and skills to understand how to speed up our training and inference. We will also use the retrospective skill to capture learnings and create new skills based on those learnings.
+**Purpose:** The goal is to use proper activation checkpointing on top of torch.compile using selective activation checkpointing (or regular checkpointing) since we are still doing very slow. Utilize compiled_resources and skills to understand how to speed up our training and inference. We will also use the retrospective skill to capture learnings and create new skills based on those learnings.
 
 Please use MCP to see whether we speed up the training while also still have the same training as the previous run. We have 2 runs for reference :
 1. https://wandb.ai/patrickirawan-mbzuai/dualtower-debug/runs/qqiatehi?nw=nwusererlandpg -> Compiled version with this config /workspace/nanoVLM_root/nanoVLM_main/configs/train.small_debug.momh.yaml
 2. https://wandb.ai/patrickirawan-mbzuai/dualtower-debug/runs/n1bvvbmm?nw=nwusererlandpg -> Uncompiled version with this config /workspace/nanoVLM_root/nanoVLM_main/configs/train.small_debug.momh.yaml
 
-You also need to use the same config after fixing the torch.compile. Please run after every fixing and see what's the performance gain. We need to minimize both compile time and training time.
+You also need to use the same config after fixing the activation checkpointing.compile. Please run after every fixing and see what's the performance gain. We need to minimize both compile time and training time.
 
 **Domain:** ML research and experimentation
 
@@ -138,3 +138,78 @@ lm_n_blocks: 8,
 lm_max_length: 1024,
 lm_tie_weights: true,
 ```
+
+## 9. MoMH Preflight Plan (Before Long Finetuning)
+
+Run this exact order before starting long MoMH finetuning jobs.
+
+### P1. Checkpoint load sanity (nanoVLM checkpoint)
+
+- Config: `configs/train.preflight.momh.checkpoint-load.yaml`
+- Goal: verify `resume_from_vlm_checkpoint` path and state transfer to dualtower run without runtime/load errors.
+- Command:
+  - `source .venv/bin/activate && python train.py --config configs/train.preflight.momh.checkpoint-load.yaml`
+- Pass criteria:
+  - Training starts and reaches step 2.
+  - No checkpoint/key mismatch errors.
+  - Loss is finite.
+
+### P2. MoMH mask invariants
+
+- Use the dataloader-mode mask checker on preflight config.
+- Command:
+  - `source .venv/bin/activate && python eval/check_momh_mask.py --mode dataloader --config configs/train.preflight.momh.stability.yaml`
+- Pass criteria:
+  - `padding_masking_ok`, `v_head_rules_ok`, `t_head_rules_ok`, `vt_head_rules_ok` are true.
+  - Inspect `cross_segment_allowed_count`:
+    - `0` means packing is segment-isolated.
+    - `>0` means packed-sample leakage risk is present; either disable packing for finetuning or fix segment-aware masking first.
+
+### P3. Non-compile MoMH stability baseline
+
+- Config: `configs/train.preflight.momh.stability.yaml`
+- Goal: establish stable loss/grad baseline before compile overhead is introduced.
+- Command:
+  - `source .venv/bin/activate && python train.py --config configs/train.preflight.momh.stability.yaml`
+- Pass criteria:
+  - Full 40-step run completes.
+  - No NaN/Inf in loss or grad norm.
+  - Throughput and loss curve look stable.
+
+### P4. Compile + selective AC preflight (optional but recommended)
+
+- Config: `configs/train.preflight.momh.compile-selective.yaml`
+- Goal: validate compile behavior and recompilation profile before long run.
+- Command:
+  - `source .venv/bin/activate && TORCH_LOGS="recompiles" python train.py --config configs/train.preflight.momh.compile-selective.yaml`
+- Pass criteria:
+  - Run completes without compile/runtime failures.
+  - Recompiles are warmup-only (no persistent shape thrash).
+  - Loss trend is close to P3 baseline.
+
+### Go / No-Go Gate
+
+Start long MoMH finetuning only if P1-P3 pass.
+- If `use_packing=true`, require `cross_segment_allowed_count == 0` from P2.
+- If using compile for the long run, P4 must also pass.
+
+## 10. RunPod Auto-Stop Wrapper
+
+When running on RunPod, use the wrapper script so training stops the pod automatically after the command ends.
+
+- Script: `./runpod_train_and_stop.sh`
+- Behavior:
+  - activate `.venv`
+  - run the training command
+  - always call `runpodctl stop pod <pod_id>` at the end
+
+### Usage
+
+- Default training command:
+  - `./runpod_train_and_stop.sh "$RUNPOD_POD_ID"`
+- Explicit config:
+  - `./runpod_train_and_stop.sh "$RUNPOD_POD_ID" -- python train.py --config configs/train.preflight.momh.stability.yaml`
+- Compile preflight:
+  - `./runpod_train_and_stop.sh "$RUNPOD_POD_ID" -- env TORCH_LOGS="recompiles" python train.py --config configs/train.preflight.momh.compile-selective.yaml`
+
+If training fails, the script still attempts pod stop, then returns a non-zero exit code.

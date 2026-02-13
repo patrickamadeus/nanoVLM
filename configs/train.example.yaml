@@ -4,6 +4,8 @@ vlm:
   vlm_checkpoint_path: "lusxvr/nanoVLM-450M"
   lm_max_length: 4096
   max_img_size: 1536
+  activation_checkpointing: false
+  activation_checkpointing_mode: "regular"
 
 train:
   lr_mp: 0.0005
@@ -21,6 +23,7 @@ train:
   val_split: "validation"
   use_packing: true
   stream_dataset: true
+  compile: false
   wandb_project: "dualtower"
   wandb_run_name_prefix: "debug"
   log_wandb: true

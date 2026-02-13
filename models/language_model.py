@@ -2,6 +2,10 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from models.activation_checkpointing import (
+    normalize_activation_checkpointing_mode,
+    run_activation_checkpoint,
+)
 from models.momh_attention import (
     create_momh_block_mask,
     create_momh_block_mask_from_modality,
@@ -582,6 +586,10 @@ class LanguageModel(nn.Module):
         self.cfg = cfg
         self.lm_use_tokens = cfg.lm_use_tokens
         self.lm_tie_weights = cfg.lm_tie_weights
+        self.activation_checkpointing = bool(getattr(cfg, "activation_checkpointing", False))
+        self.activation_checkpointing_mode = normalize_activation_checkpointing_mode(
+            getattr(cfg, "activation_checkpointing_mode", "regular")
+        )
 
         self.token_embedding = nn.Embedding(cfg.lm_vocab_size, cfg.lm_hidden_dim)
         self.rotary_embd = RotaryEmbedding(cfg)
@@ -691,17 +699,47 @@ class LanguageModel(nn.Module):
             )
 
         for i, block in enumerate(self.blocks):
-            x, kv_cache[i] = block(
-                x,
-                cos,
-                sin,
-                attention_mask=attention_mask,
-                block_kv_cache=kv_cache[i],
-                block_mask=prefill_block_mask,
-                content_starts=content_starts,
-                is_vision=is_vision,
-                position_offset=position_offset,
-            )
+            block_kv_cache = kv_cache[i]
+            if self.activation_checkpointing and self.training and block_kv_cache is None:
+                # Bind `block` into the closure to avoid late-bound recompute issues.
+                def _run_block(
+                    x_in,
+                    cos_in,
+                    sin_in,
+                    _block=block,
+                    _block_kv_cache=block_kv_cache,
+                ):
+                    return _block(
+                        x_in,
+                        cos_in,
+                        sin_in,
+                        attention_mask=attention_mask,
+                        block_kv_cache=_block_kv_cache,
+                        block_mask=prefill_block_mask,
+                        content_starts=content_starts,
+                        is_vision=is_vision,
+                        position_offset=position_offset,
+                    )
+
+                x, kv_cache[i] = run_activation_checkpoint(
+                    _run_block,
+                    x,
+                    cos,
+                    sin,
+                    mode=self.activation_checkpointing_mode,
+                )
+            else:
+                x, kv_cache[i] = block(
+                    x,
+                    cos,
+                    sin,
+                    attention_mask=attention_mask,
+                    block_kv_cache=block_kv_cache,
+                    block_mask=prefill_block_mask,
+                    content_starts=content_starts,
+                    is_vision=is_vision,
+                    position_offset=position_offset,
+                )
 
         x = self.norm(x)
 

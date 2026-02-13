@@ -112,7 +112,7 @@ vlm:
   hf_repo_name: nanoVLM
   left_tower_mask_mode: visual_only
   activation_checkpointing: true
-  activation_checkpointing_mode: "regular"
+  activation_checkpointing_mode: "selective"
 
 train:
   lr_mp: 0.0005
@@ -133,9 +133,8 @@ train:
   max_images_per_knapsack: 8
   max_sample_length: 512
   use_packing: true
-  compile: fals  activation_checkpointing: false
-  activation_checkpointing_mode: "regular"e
-  resume_from_vlm_checkpoint: false
+  compile: true
+  resume_from_vlm_checkpoint: true
   train_dataset_path: patrickamadeus/the_cauldron
   train_dataset_name:
   - sample_1pct
@@ -147,9 +146,9 @@ train:
   visual_dependency_min_rating: 1
   formatting_min_rating: 1
   wandb_entity: patrickirawan-mbzuai
-  wandb_project: "dualtower-debug"
-  wandb_run_name_prefix: "debug"
-  log_wandb: true
+  wandb_project: "dualtower-preflight"
+  wandb_run_name_prefix: "preflight-compile"
+  log_wandb: false
   use_lmms_eval: false
   lmms_eval_tasks: mmstar,mmmu_val,ocrbench,textvqa_val,docvqa_val,scienceqa,mme,infovqa_val,chartqa
   lmms_eval_limit: null

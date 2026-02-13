@@ -2,6 +2,10 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from models.activation_checkpointing import (
+    normalize_activation_checkpointing_mode,
+    run_activation_checkpoint,
+)
 
 # https://github.com/huggingface/transformers/blob/main/src/transformers/models/siglip/modeling_siglip.py#L245
 class ViTPatchEmbeddings(nn.Module):
@@ -132,6 +136,10 @@ class ViT(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.cfg = cfg
+        self.activation_checkpointing = bool(getattr(cfg, "activation_checkpointing", False))
+        self.activation_checkpointing_mode = normalize_activation_checkpointing_mode(
+            getattr(cfg, "activation_checkpointing_mode", "regular")
+        )
         self.patch_embedding = ViTPatchEmbeddings(cfg)
         self.cls_flag = cfg.vit_cls_flag
         self.dropout = nn.Dropout(cfg.vit_dropout)
@@ -157,7 +165,18 @@ class ViT(nn.Module):
         x = self.patch_embedding(x) 
         x = self.dropout(x)
         for block in self.blocks:
-            x = block(x)
+            if self.activation_checkpointing and self.training:
+                # Bind `block` into the closure to avoid late-bound recompute issues.
+                def _run_block(x_in, _block=block):
+                    return _block(x_in)
+
+                x = run_activation_checkpoint(
+                    _run_block,
+                    x,
+                    mode=self.activation_checkpointing_mode,
+                )
+            else:
+                x = block(x)
 
         if self.cls_flag:
             x = self.layer_norm(x[:, 0])

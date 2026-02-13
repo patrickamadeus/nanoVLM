@@ -32,6 +32,7 @@ from data.advanced_datasets import ConstantLengthDataset
 from data.processors import get_image_processor, get_tokenizer
 
 import models.config as config
+from models.activation_checkpointing import normalize_activation_checkpointing_mode
 from models.language_model import LanguageModel
 from models.vision_language_model import VisionLanguageModel
 from models.dual_tower.dual_tower import DualTowerVLM
@@ -485,6 +486,18 @@ def train(train_cfg, vlm_cfg, model_mode: str = "nanovlm"):
     if train_cfg.use_lmms_eval:
         raise ValueError(
             "use_lmms_eval=True is not supported in this hub-only checkpoint workflow."
+        )
+    vlm_cfg.activation_checkpointing_mode = normalize_activation_checkpointing_mode(
+        getattr(vlm_cfg, "activation_checkpointing_mode", "regular")
+    )
+    if (
+        bool(getattr(vlm_cfg, "activation_checkpointing", False))
+        and vlm_cfg.activation_checkpointing_mode == "selective"
+        and not train_cfg.compile
+    ):
+        raise ValueError(
+            "Selective activation checkpointing requires `train.compile=True`. "
+            "Set `vlm.activation_checkpointing_mode: regular` or enable compile."
         )
 
     train_loader, val_loader, iter_train_loader, iter_val_loader = get_dataloaders(train_cfg, vlm_cfg)

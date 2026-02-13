@@ -1,3 +1,34 @@
+## 2026-02-13 — Activation Checkpointing Integration (regular + selective)
+
+**Type:** Observation
+**General description:** Added activation checkpointing modes with compile-aware validation and ran smoke tests for compile/selective, non-compile/regular, and invalid non-compile/selective settings.
+
+### Details
+
+Code integration:
+- Added `vlm.activation_checkpointing` and `vlm.activation_checkpointing_mode` config fields.
+- Added shared AC helper (`models/activation_checkpointing.py`) with:
+  - `regular`: `checkpoint(..., use_reentrant=False)`
+  - `selective`: `create_selective_checkpoint_contexts(..., allow_cache_entry_mutation=True)`
+- Wired activation checkpointing into LM and ViT block loops with closure-safe block binding.
+- Added fail-fast validation in `train.py`: `selective` mode requires `train.compile=True`.
+
+Smoke validation:
+- `compile=true + selective`: completed 2 training steps successfully.
+- `compile=false + regular`: completed 1 training step successfully.
+- `compile=false + selective`: raised the expected fail-fast `ValueError` before dataloader/model setup.
+
+### Key Points
+
+- Integration is minimal and explicit: one helper module, two config fields, and block-loop wiring.
+- Non-compile path now has an enforced single valid AC mode (`regular`).
+- Selective mode remains available for compile runs without silent fallback behavior.
+
+### Links
+
+- Report: `training_reports/activation-checkpointing-integration-2026-02-13.md`
+- Code: `models/activation_checkpointing.py`, `models/language_model.py`, `models/vision_transformer.py`, `models/config.py`, `train.py`
+
 ## 2026-02-13 — MoMH with Packed Samples Segment Isolation Gap
 
 **Type:** Retrospective
