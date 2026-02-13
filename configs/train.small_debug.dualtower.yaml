@@ -130,7 +130,7 @@ train:
   max_images_per_knapsack: 8
   max_sample_length: 512
   use_packing: true
-  compile: true
+  compile: false
   resume_from_vlm_checkpoint: false
   train_dataset_path: patrickamadeus/the_cauldron
   train_dataset_name:

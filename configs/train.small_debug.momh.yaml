@@ -133,7 +133,7 @@ train:
   max_images_per_knapsack: 8
   max_sample_length: 512
   use_packing: true
-  compile: false
+  compile: true
   resume_from_vlm_checkpoint: false
   train_dataset_path: patrickamadeus/the_cauldron
   train_dataset_name:
@@ -146,7 +146,7 @@ train:
   visual_dependency_min_rating: 1
   formatting_min_rating: 1
   wandb_entity: patrickirawan-mbzuai
-  wandb_project: "dualtower-debug"
+  wandb_project: "dualtower-debugcompile"
   wandb_run_name_prefix: "debug"
   log_wandb: true
   use_lmms_eval: false
