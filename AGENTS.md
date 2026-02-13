@@ -146,9 +146,9 @@ Run this exact order before starting long MoMH finetuning jobs.
 ### P1. Checkpoint load sanity (nanoVLM checkpoint)
 
 - Config: `configs/train.preflight.momh.checkpoint-load.yaml`
-- Goal: verify `resume_from_vlm_checkpoint` path and state transfer to dualtower run without runtime/load errors.
+- Goal: verify `resume_from_vlm_checkpoint` path and state transfer to the current nanoVLM MoMH run without runtime/load errors.
 - Command:
-  - `source .venv/bin/activate && python train.py --config configs/train.preflight.momh.checkpoint-load.yaml`
+  - `export HF_HOME=/workspace/huggingface && source .venv/bin/activate && python train.py --config configs/train.preflight.momh.checkpoint-load.yaml`
 - Pass criteria:
   - Training starts and reaches step 2.
   - No checkpoint/key mismatch errors.
@@ -158,7 +158,7 @@ Run this exact order before starting long MoMH finetuning jobs.
 
 - Use the dataloader-mode mask checker on preflight config.
 - Command:
-  - `source .venv/bin/activate && python eval/check_momh_mask.py --mode dataloader --config configs/train.preflight.momh.stability.yaml`
+  - `export HF_HOME=/workspace/huggingface && source .venv/bin/activate && python eval/check_momh_mask.py --mode dataloader --config configs/train.preflight.momh.stability.yaml`
 - Pass criteria:
   - `padding_masking_ok`, `v_head_rules_ok`, `t_head_rules_ok`, `vt_head_rules_ok` are true.
   - Inspect `cross_segment_allowed_count`:
@@ -170,7 +170,7 @@ Run this exact order before starting long MoMH finetuning jobs.
 - Config: `configs/train.preflight.momh.stability.yaml`
 - Goal: establish stable loss/grad baseline before compile overhead is introduced.
 - Command:
-  - `source .venv/bin/activate && python train.py --config configs/train.preflight.momh.stability.yaml`
+  - `export HF_HOME=/workspace/huggingface && source .venv/bin/activate && python train.py --config configs/train.preflight.momh.stability.yaml`
 - Pass criteria:
   - Full 40-step run completes.
   - No NaN/Inf in loss or grad norm.
@@ -181,7 +181,7 @@ Run this exact order before starting long MoMH finetuning jobs.
 - Config: `configs/train.preflight.momh.compile-selective.yaml`
 - Goal: validate compile behavior and recompilation profile before long run.
 - Command:
-  - `source .venv/bin/activate && TORCH_LOGS="recompiles" python train.py --config configs/train.preflight.momh.compile-selective.yaml`
+  - `export HF_HOME=/workspace/huggingface && source .venv/bin/activate && TORCH_LOGS="recompiles" python train.py --config configs/train.preflight.momh.compile-selective.yaml`
 - Pass criteria:
   - Run completes without compile/runtime failures.
   - Recompiles are warmup-only (no persistent shape thrash).
@@ -200,6 +200,7 @@ When running on RunPod, use the wrapper script so training stops the pod automat
 - Script: `./runpod_train_and_stop.sh`
 - Behavior:
   - activate `.venv`
+  - export `HF_HOME` (defaults to `/workspace/huggingface` in the wrapper)
   - run the training command
   - always call `runpodctl stop pod <pod_id>` at the end
 

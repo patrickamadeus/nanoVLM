@@ -813,7 +813,10 @@ class LanguageModel(nn.Module):
         import torch.nn.init as init
         import json
         from huggingface_hub.utils import EntryNotFoundError
-                
+
+        requested_lm_max_position_embeddings = getattr(cfg, "lm_max_position_embeddings", None)
+        requested_lm_max_length = getattr(cfg, "lm_max_length", None)
+
         # Load the HuggingFace config
         hf_config = AutoConfig.from_pretrained(cfg.lm_model_type)
         
@@ -825,8 +828,24 @@ class LanguageModel(nn.Module):
         cfg.lm_hidden_dim = hf_config.hidden_size
         cfg.lm_inter_dim = hf_config.intermediate_size
         cfg.lm_rms_eps = hf_config.rms_norm_eps
-        cfg.lm_re_base = hf_config.rope_theta
-        cfg.lm_max_position_embeddings = hf_config.max_position_embeddings
+        rope_theta = getattr(hf_config, "rope_theta", None)
+        if rope_theta is None:
+            rope_parameters = getattr(hf_config, "rope_parameters", None)
+            if isinstance(rope_parameters, dict):
+                rope_theta = rope_parameters.get("rope_theta")
+        if rope_theta is None:
+            raise ValueError(
+                f"Could not resolve rope_theta from model config '{cfg.lm_model_type}'."
+            )
+        cfg.lm_re_base = rope_theta
+        if requested_lm_max_position_embeddings is None:
+            cfg.lm_max_position_embeddings = hf_config.max_position_embeddings
+        else:
+            cfg.lm_max_position_embeddings = int(requested_lm_max_position_embeddings)
+        if requested_lm_max_length is None:
+            cfg.lm_max_length = cfg.lm_max_position_embeddings
+        else:
+            cfg.lm_max_length = int(requested_lm_max_length)
         # We're keeping our own vocab size in cfg, but checking it's larger than original
         if hasattr(cfg, 'lm_vocab_size'):
             if cfg.lm_vocab_size < original_vocab_size:

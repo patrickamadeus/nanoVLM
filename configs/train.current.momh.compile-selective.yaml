@@ -42,7 +42,7 @@ vlm:
   momh_head_pct_vision: 0.2
   momh_head_pct_text: 0.3
   activation_checkpointing: true
-  activation_checkpointing_mode: "regular"
+  activation_checkpointing_mode: "selective"
   max_img_size: 2048
   resize_to_max_side_len: false
   vlm_extra_tokens:
@@ -130,13 +130,13 @@ train:
   eval_interval: 500
   checkpoint_interval: 500
   stats_log_interval: 100
-  max_training_steps: 40
+  max_training_steps: 5000
   max_images_per_example: 1
   max_images_per_knapsack: 18
   max_sample_length: 4096
   use_packing: true
-  compile: false
-  resume_from_vlm_checkpoint: true
+  compile: true
+  resume_from_vlm_checkpoint: false
   train_dataset_path: patrickamadeus/the_cauldron
   train_dataset_name:
   - all
@@ -148,14 +148,14 @@ train:
   visual_dependency_min_rating: 1
   formatting_min_rating: 1
   wandb_entity: patrickirawan-mbzuai
-  wandb_project: "momh-preflight"
-  wandb_run_name_prefix: "preflight-ckpt-4096"
+  wandb_project: "momh"
+  wandb_run_name_prefix: "momh-compile-selective"
   log_wandb: true
   use_lmms_eval: false
   lmms_eval_tasks: mmstar,mmmu_val,ocrbench,textvqa_val,docvqa_val,scienceqa,mme,infovqa_val,chartqa
   lmms_eval_limit: null
   lmms_eval_batch_size: 64
-  push_checkpoints_to_hub: false
+  push_checkpoints_to_hub: true
   checkpoint_repo_pattern: patrickamadeus/momh-dt8k1img-ref-step-{i}
   hf_private: false
   push_final_model_to_hub: false

@@ -1,29 +1,29 @@
-mode: dualtower
+mode: nanovlm
 vlm:
-  vit_hidden_dim: 384
-  vit_inter_dim: 512
+  vit_hidden_dim: 768
+  vit_inter_dim: 3072
   vit_patch_size: 16
-  vit_img_size: 256
-  vit_n_heads: 6
+  vit_img_size: 512
+  vit_n_heads: 12
   vit_dropout: 0.0
-  vit_n_blocks: 2
+  vit_n_blocks: 12
   vit_ln_eps: 1.0e-06
   vit_cls_flag: false
   vit_model_type: google/siglip2-base-patch16-512
-  lm_hidden_dim: 384
-  lm_inter_dim: 512
+  lm_hidden_dim: 960
+  lm_inter_dim: 2560
   lm_rms_eps: 1.0e-05
   lm_re_base: 100000
-  lm_max_position_embeddings: 2048
+  lm_max_position_embeddings: 4096
   lm_base_vocab_size: 49152
   extra_token_amount: 66
   lm_vocab_size: 49218
-  lm_n_heads: 8
-  lm_n_kv_heads: 4
+  lm_n_heads: 15
+  lm_n_kv_heads: 5
   lm_dropout: 0.0
-  lm_n_blocks: 4
+  lm_n_blocks: 32
   lm_attn_scaling: 1.0
-  lm_max_length: 512
+  lm_max_length: 4096
   lm_use_tokens: false
   lm_tie_weights: true
   lm_model_type: HuggingFaceTB/SmolLM2-135M-Instruct
@@ -37,8 +37,13 @@ vlm:
 
     '' }}{% endif %}'
   mp_pixel_shuffle_factor: 4
-  mp_image_token_length: 16
-  max_img_size: 1024
+  mp_image_token_length: 64
+  momh_enabled: true
+  momh_head_pct_vision: 0.2
+  momh_head_pct_text: 0.3
+  activation_checkpointing: true
+  activation_checkpointing_mode: "selective"
+  max_img_size: 2048
   resize_to_max_side_len: false
   vlm_extra_tokens:
     image_token: <|image|>
@@ -107,13 +112,10 @@ vlm:
     r8c6: <row_8_col_6>
     r8c7: <row_8_col_7>
     r8c8: <row_8_col_8>
-  vlm_load_backbone_weights: false
+  vlm_load_backbone_weights: true
   vlm_checkpoint_path: lusxvr/nanoVLM-230M-8k
   hf_repo_name: nanoVLM
   left_tower_mask_mode: visual_only
-  activation_checkpointing: true
-  activation_checkpointing_mode: "selective"
-
 train:
   lr_mp: 0.0005
   lr_vision_backbone: 0
@@ -121,23 +123,23 @@ train:
   lr_left_tower: null
   lr_right_tower: 0.0
   val_size: 50000
-  batch_size: 4
+  batch_size: 32
   gradient_accumulation_steps: 4
   max_grad_norm: 1.0
   eval_in_epochs: true
-  eval_interval: 100
-  checkpoint_interval: 100
-  stats_log_interval: 20
+  eval_interval: 500
+  checkpoint_interval: 500
+  stats_log_interval: 100
   max_training_steps: 40
   max_images_per_example: 1
-  max_images_per_knapsack: 8
-  max_sample_length: 512
+  max_images_per_knapsack: 18
+  max_sample_length: 4096
   use_packing: true
   compile: true
-  resume_from_vlm_checkpoint: true
+  resume_from_vlm_checkpoint: false
   train_dataset_path: patrickamadeus/the_cauldron
   train_dataset_name:
-  - sample_1pct
+  - all
   train_split: train
   val_split: validation
   stream_dataset: false
@@ -146,14 +148,14 @@ train:
   visual_dependency_min_rating: 1
   formatting_min_rating: 1
   wandb_entity: patrickirawan-mbzuai
-  wandb_project: "dualtower-preflight"
-  wandb_run_name_prefix: "preflight-compile"
-  log_wandb: false
+  wandb_project: "momh-preflight"
+  wandb_run_name_prefix: "preflight-compile-4096"
+  log_wandb: true
   use_lmms_eval: false
   lmms_eval_tasks: mmstar,mmmu_val,ocrbench,textvqa_val,docvqa_val,scienceqa,mme,infovqa_val,chartqa
   lmms_eval_limit: null
   lmms_eval_batch_size: 64
   push_checkpoints_to_hub: false
-  checkpoint_repo_pattern: patrickamadeus/dt8k1img-ref-step-{i}
+  checkpoint_repo_pattern: patrickamadeus/momh-dt8k1img-ref-step-{i}
   hf_private: false
   push_final_model_to_hub: false

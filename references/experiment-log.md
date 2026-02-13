@@ -118,3 +118,188 @@ Diagnostic run:
 
 - Report: `training_reports/torch-compile-regionalization-dualtower-2026-02-13.md`
 - Code: `train.py`
+
+## 2026-02-13 — Prepared Current MoMH Compile+Selective Run Config
+
+**Type:** Configuration
+**General description:** Added a long-run current-style config for nanoVLM with MoMH enabled, compile enabled, and selective activation checkpointing, including explicit W&B settings.
+
+### Details
+
+Created `configs/train.current.momh.compile-selective.yaml` by deriving from `configs/train.current.yaml` and applying:
+- `vlm.momh_enabled: true`
+- `vlm.momh_head_pct_vision: 0.2`
+- `vlm.momh_head_pct_text: 0.3`
+- `vlm.activation_checkpointing: true`
+- `vlm.activation_checkpointing_mode: "selective"`
+- `train.compile: true`
+- Explicit W&B fields:
+  - `train.wandb_entity: patrickirawan-mbzuai`
+  - `train.wandb_project: momh`
+  - `train.wandb_run_name_prefix: momh-compile-selective`
+  - `train.log_wandb: true`
+
+### Key Points
+
+- This is a `train.current`-style configuration intended for full runs, not a short preflight config.
+- W&B routing is now explicit in the YAML and does not depend on dataclass defaults.
+
+### Links
+
+- Config: `configs/train.current.momh.compile-selective.yaml`
+
+## 2026-02-13 — 4096 Context Config + Backbone Context Preservation Fix
+
+**Type:** Configuration
+**General description:** Updated the current MoMH compile/selective config to 4096 context and fixed LM backbone loading so user-configured context length is preserved instead of being overwritten by HF defaults.
+
+### Details
+
+Config updates in `configs/train.current.momh.compile-selective.yaml`:
+- `vlm.lm_max_position_embeddings: 4096`
+- `vlm.lm_max_length: 4096`
+- `train.max_sample_length: 4096`
+- `train.resume_from_vlm_checkpoint: false` (already set previously so MoMH/selective settings remain active)
+
+Code updates in `models/language_model.py` (`LanguageModel.from_pretrained`):
+- Preserve requested `lm_max_position_embeddings` and `lm_max_length` from config when loading HF backbone weights.
+- Add robust `rope_theta` resolution:
+  - use `hf_config.rope_theta` when available
+  - fallback to `hf_config.rope_parameters["rope_theta"]`
+  - fail fast with explicit `ValueError` if neither exists
+
+Validation:
+- Instantiating `VisionLanguageModel(..., load_backbone=True)` with the 4096 config now yields:
+  - `cfg_lm_max_position_embeddings = 4096`
+  - `cfg_lm_max_length = 4096`
+  - `decoder.rotary_embd.original_max_seq_len = 4096`
+- Fast test suite check: `pytest -q tests/test_activation_checkpointing.py` passed (`4 passed`).
+
+### Key Points
+
+- The earlier "config says 4096 but model still uses 8192" issue was real in the backbone load path and is now fixed.
+- This change affects backbone initialization only; it does not silently change any training hyperparameters.
+
+### Links
+
+- Config: `configs/train.current.momh.compile-selective.yaml`
+- Code: `models/language_model.py`
+
+## 2026-02-13 — Batch Size Probe Blocked by GPU/PyTorch Capability Mismatch
+
+**Type:** Observation
+**General description:** Attempted quick OOM-based max-batch probe for the 4096-context MoMH compile/selective setup, but execution fails before memory pressure due to unsupported GPU architecture in current PyTorch build.
+
+### Details
+
+Probe outcome:
+- First probe at `batch_size=1` failed with:
+  - `CUDA error: no kernel image is available for execution on the device`
+- No valid OOM boundary could be measured because kernels do not launch successfully.
+
+Environment check:
+- GPU: `NVIDIA RTX PRO 6000 Blackwell Server Edition` (`sm_120`)
+- Installed torch: `2.10.0+cu126`
+- PyTorch warning indicates current build supports up to `sm_90` and recommends CUDA 12.8/13.0 builds for this GPU.
+
+### Key Points
+
+- Max non-OOM batch size is currently **unknown** on this machine until PyTorch/CUDA wheel supports `sm_120`.
+- This is an environment compatibility issue, not a model/config OOM result.
+
+### Links
+
+- Config under test: `configs/train.current.momh.compile-selective.yaml`
+
+## 2026-02-13 — Max Microbatch Probe on Blackwell After Torch Reinstall
+
+**Type:** Observation
+**General description:** Re-ran OOM boundary probing on the `4096` MoMH compile/selective config after reinstalling torch with Blackwell support.
+
+### Details
+
+Environment:
+- GPU: `NVIDIA RTX PRO 6000 Blackwell Server Edition` (`sm_120`)
+- torch: `2.10.0+cu128`
+
+Config under test:
+- `configs/train.current.momh.compile-selective.yaml`
+- `vlm.lm_max_position_embeddings=4096`, `vlm.lm_max_length=4096`, `train.max_sample_length=4096`
+- `vlm.momh_enabled=true`
+- `vlm.activation_checkpointing=true`, `vlm.activation_checkpointing_mode=selective`
+- `train.compile=true`
+- `train.resume_from_vlm_checkpoint=false`, `vlm.vlm_load_backbone_weights=true`
+
+Method:
+- Synthetic one-step train probe (forward + backward + optimizer step) with real model init/backbone load.
+- Regional decoder compile path (`_apply_regional_compile`) enabled.
+- Exponential search + binary search over microbatch size, then fresh-process confirmation.
+
+Measured boundary:
+- Success up to `microbatch=32`
+- First OOM at `microbatch=33`
+
+Fresh-process confirmation:
+- `bs=32` -> success (`peak_mb=91425.61`)
+- `bs=33` -> OOM (`peak_mb=87547.14`, early-fail peak)
+
+### Key Points
+
+- Current best known per-step microbatch ceiling for this setup is `32`.
+- Effective global batch still depends on `gradient_accumulation_steps` and number of GPUs.
+- Config was updated to use `train.batch_size: 32` in `configs/train.current.momh.compile-selective.yaml`.
+
+### Links
+
+- Config: `configs/train.current.momh.compile-selective.yaml`
+- Code path: `train.py` (`_apply_regional_compile`), `models/vision_language_model.py`
+
+## 2026-02-13 — Preflight Config Alignment + W&B/HF_HOME Validation
+
+**Type:** Configuration
+**General description:** Aligned MoMH preflight configs to the same 4096-context current baseline, enabled explicit W&B logging for preflight, and validated online W&B logging with `HF_HOME` exported first.
+
+### Details
+
+Preflight configs were rebuilt from the same base as `configs/train.current.momh.compile-selective.yaml` and then specialized per preflight intent:
+- `configs/train.preflight.momh.checkpoint-load.yaml`
+- `configs/train.preflight.momh.stability.yaml`
+- `configs/train.preflight.momh.compile-selective.yaml`
+
+Shared aligned settings:
+- `mode: nanovlm`
+- `lm_max_position_embeddings=4096`, `lm_max_length=4096`, `max_sample_length=4096`
+- `batch_size=32`, `gradient_accumulation_steps=16`
+- `momh_enabled=true`
+- `wandb_entity=patrickirawan-mbzuai`
+- `log_wandb=true`
+
+Step-specific toggles:
+- checkpoint-load: `max_training_steps=2`, `compile=false`, `resume_from_vlm_checkpoint=true`, `activation_checkpointing_mode=regular`
+- stability: `max_training_steps=40`, `compile=false`, `resume_from_vlm_checkpoint=false`, `activation_checkpointing_mode=regular`
+- compile-selective: `max_training_steps=40`, `compile=true`, `resume_from_vlm_checkpoint=false`, `activation_checkpointing_mode=selective`
+
+W&B reliability updates:
+- `train.py` now passes `entity=train_cfg.wandb_entity` in `wandb.init(...)` so config-driven entity selection is honored.
+- `train.py` `_apply_checkpoint_cfg_overrides(...)` now preserves requested runtime behavior fields (`momh_*`, `activation_checkpointing*`, and max-length overrides) when `resume_from_vlm_checkpoint=true`.
+- `runpod_train_and_stop.sh` now exports `HF_HOME=${HF_HOME:-/workspace/huggingface}` after venv activation.
+- `AGENTS.md` preflight command examples now include `export HF_HOME=/workspace/huggingface && ...` prefixes.
+- Ran smoke logging with required command prefix:
+  - `export HF_HOME=/workspace/huggingface && source .venv/bin/activate && python ...`
+  - Successful run URL: `https://wandb.ai/patrickirawan-mbzuai/momh-preflight/runs/xx3ec62n`
+
+Validation:
+- Config parsing checks passed for all aligned configs.
+- Added `tests/test_train_checkpoint_cfg.py` to lock checkpoint-config override behavior.
+- `pytest -q tests/test_train_checkpoint_cfg.py tests/test_activation_checkpointing.py` passed (`5 passed`).
+
+### Key Points
+
+- Preflight is now configuration-consistent with the current MoMH compile/selective run setup.
+- Script invocations should always export `HF_HOME=/workspace/huggingface` first.
+- W&B online logging is confirmed functional in this environment.
+
+### Links
+
+- Configs: `configs/train.current.momh.compile-selective.yaml`, `configs/train.preflight.momh.checkpoint-load.yaml`, `configs/train.preflight.momh.stability.yaml`, `configs/train.preflight.momh.compile-selective.yaml`
+- Code: `train.py`

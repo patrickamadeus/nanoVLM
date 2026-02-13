@@ -52,6 +52,7 @@ if [[ ! -f ".venv/bin/activate" ]]; then
 fi
 
 source .venv/bin/activate
+export HF_HOME="${HF_HOME:-/workspace/huggingface}"
 
 TRAIN_EXIT_CODE=0
 "${TRAIN_CMD[@]}" || TRAIN_EXIT_CODE=$?

@@ -409,9 +409,22 @@ def _build_decode_preview(model, logits, labels):
 def _apply_checkpoint_cfg_overrides(loaded_cfg, requested_cfg):
     if loaded_cfg is None:
         raise ValueError("Loaded checkpoint model is missing `cfg`.")
-    loaded_cfg.lm_max_length = requested_cfg.lm_max_length
-    loaded_cfg.lm_max_position_embeddings = requested_cfg.lm_max_position_embeddings
-    loaded_cfg.resize_to_max_side_len = getattr(requested_cfg, "resize_to_max_side_len", False)
+    # Preserve runtime behavior knobs from the requested config when loading a
+    # full VLM checkpoint. We intentionally do not override architecture-shape
+    # fields here.
+    preserve_fields = (
+        "lm_max_length",
+        "lm_max_position_embeddings",
+        "resize_to_max_side_len",
+        "momh_enabled",
+        "momh_head_pct_vision",
+        "momh_head_pct_text",
+        "activation_checkpointing",
+        "activation_checkpointing_mode",
+    )
+    for field_name in preserve_fields:
+        if hasattr(requested_cfg, field_name):
+            setattr(loaded_cfg, field_name, getattr(requested_cfg, field_name))
     return loaded_cfg
 
 
@@ -514,7 +527,7 @@ def train(train_cfg, vlm_cfg, model_mode: str = "nanovlm"):
     run = None
     if train_cfg.log_wandb and is_master():
         run = wandb.init(
-            # entity=train_cfg.wandb_entity,
+            entity=train_cfg.wandb_entity,
             project=train_cfg.wandb_project,
             config={
                 "VLMConfig": asdict(vlm_cfg),
