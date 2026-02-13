@@ -1,0 +1,26 @@
+mode: nanovlm
+
+vlm:
+  vlm_checkpoint_path: "lusxvr/nanoVLM-450M"
+  lm_max_length: 4096
+  max_img_size: 1536
+
+train:
+  lr_mp: 0.0005
+  lr_language_backbone: 0.0001
+  lr_vision_backbone: 0.0
+  batch_size: 4
+  gradient_accumulation_steps: 16
+  max_training_steps: 20000
+  checkpoint_interval: 500
+  checkpoint_repo_pattern: "patrickamadeus/dt8k1img-ref-step-{i}"
+  train_dataset_path: "patrickamadeus/the_cauldron"
+  train_dataset_name:
+    - default
+  train_split: "train"
+  val_split: "validation"
+  use_packing: true
+  stream_dataset: true
+  wandb_project: "dualtower"
+  wandb_run_name_prefix: "debug"
+  log_wandb: true

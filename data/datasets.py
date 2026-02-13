@@ -85,9 +85,9 @@ class BaseDataset(Dataset):
         cursor = 0
         for msg in messages:
             segment_ids = self.tokenizer.apply_chat_template(
-                [msg], tokenize=True, add_special_tokens=False
+                [msg], tokenize=True, add_special_tokens=False, return_dict=True
             )
-            seg_len = len(segment_ids)
+            seg_len = len(segment_ids["input_ids"])
 
             if msg["role"] == "assistant":
                 start = cursor + self.prefix_len
@@ -129,6 +129,9 @@ class VQADataset(BaseDataset):  # Visual Question Answering Dataset
 
         input_ids, mask, attention_mask = self._prepare_inputs_and_loss_mask(messages)
         labels = self._get_labels(input_ids, mask)
+        # if int((labels != -100).sum().item()) == 0:
+        #     # Skip samples that provide no supervised targets.
+        #     return None
 
         return {
             "images": processed_images,

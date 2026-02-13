@@ -5,6 +5,9 @@ import torch
 from models.vision_language_model import VisionLanguageModel
 from models.dual_tower.dual_tower import DualTowerVLM
 import models.config as config
+from train_utils.env import load_project_dotenv
+
+load_project_dotenv()
 
 def main():
     parser = argparse.ArgumentParser(description="Run lmms-eval on a model checkpoint.")

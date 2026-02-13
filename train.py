@@ -1,6 +1,7 @@
 import os
 import math
 import time
+import sys
 import textwrap
 import torch
 import wandb
@@ -35,8 +36,16 @@ from models.language_model import LanguageModel
 from models.vision_language_model import VisionLanguageModel
 from models.dual_tower.dual_tower import DualTowerVLM
 from train_utils.console import ctext, log_debug, log_info, log_success, log_warn, progress_color
+from train_utils.config_loader import (
+    ConfigError,
+    apply_dataclass_overrides,
+    load_yaml_mapping,
+    validate_allowed_keys,
+)
+from train_utils.env import load_project_dotenv
 
 #Otherwise, the tokenizer will throw a warning
+load_project_dotenv()
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 
@@ -114,8 +123,11 @@ def get_run_name(train_cfg, vlm_cfg):
     vit = f"{vlm_cfg.vit_model_type.split('/')[-1]}" + f"_{vlm_cfg.max_img_size}"
     mp = f"mp{vlm_cfg.mp_pixel_shuffle_factor}"
     llm = f"{vlm_cfg.lm_model_type.split('/')[-1]}"
+    prefix = train_cfg.wandb_run_name_prefix.strip()
+    if prefix:
+        prefix = f"{prefix}_"
 
-    return f"nanoVLM_{vit}_{mp}_{llm}_{num_gpus}_{batch_size}_{max_training_steps}_{learning_rate}_{date}"
+    return f"{prefix}nanoVLM_{vit}_{mp}_{llm}_{num_gpus}_{batch_size}_{max_training_steps}_{learning_rate}_{date}"
 
 def get_optimizer_lrs(optimizer, train_cfg):
     lrs = {}
@@ -430,7 +442,7 @@ def train(train_cfg, vlm_cfg, model_mode: str = "nanovlm"):
     if train_cfg.log_wandb and is_master():
         run = wandb.init(
             # entity=train_cfg.wandb_entity,
-            project="dualtower",
+            project=train_cfg.wandb_project,
             config={
                 "VLMConfig": asdict(vlm_cfg),
                 "TrainConfig": asdict(train_cfg)
@@ -688,6 +700,7 @@ def train(train_cfg, vlm_cfg, model_mode: str = "nanovlm"):
                     )
                     loss_token_count_value = int(loss_token_count.item())
                     if loss_token_count_value <= 0:
+                        breakpoint()
                         raise ValueError("Found a batch with no valid target tokens; check label masking.")
                     accumulated_loss_sum += loss.detach().to(dtype=torch.float32)
                     accumulated_loss_tokens += loss_token_count.to(dtype=torch.float32)
@@ -1074,7 +1087,52 @@ def train(train_cfg, vlm_cfg, model_mode: str = "nanovlm"):
 
 def main():
     global PG_CPU
+
+    def _flag_present(argv, flag):
+        return any(arg == flag or arg.startswith(f"{flag}=") for arg in argv)
+
+    def _validate_config_mode_overrides(argv):
+        disallowed_flags = (
+            "--lr_mp",
+            "--lr_vision_backbone",
+            "--lr_language_backbone",
+            "--lr_left_tower",
+            "--lr_right_tower",
+            "--vlm_checkpoint_path",
+            "--left_tower_mask_mode",
+            "--compile",
+            "--log_wandb",
+            "--resume_from_vlm_checkpoint",
+            "--no_log_wandb",
+            "--train_dataset_path",
+            "--train_dataset_name",
+            "--train_split",
+            "--val_split",
+            "--checkpoint_interval",
+            "--checkpoint_repo_pattern",
+            "--no_checkpoint_push",
+            "--no_lmms_eval",
+            "--relevance_min_rating",
+            "--image_correspondence_min_rating",
+            "--visual_dependency_min_rating",
+            "--formatting_min_rating",
+            "--packing",
+            "--no_packing",
+        )
+        provided = [flag for flag in disallowed_flags if _flag_present(argv, flag)]
+        if provided:
+            provided_text = ", ".join(provided)
+            raise ConfigError(
+                "When --config is provided, only --nanovlm/--dualtower can override the config mode. "
+                f"Remove these CLI overrides: {provided_text}."
+            )
+
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        '--config',
+        type=str,
+        help='Path to a YAML training config file. When provided, non-mode CLI overrides are disallowed.',
+    )
     parser.add_argument('--lr_mp', type=float, help='Learning rate for the mapping network')
     parser.add_argument('--lr_vision_backbone', type=float, help='Learning rate for the vision backbone')
     parser.add_argument('--lr_language_backbone', type=float, help='Learning rate for the language backbone')
@@ -1115,35 +1173,84 @@ def main():
 
     vlm_cfg = config.VLMConfig()
     train_cfg = config.TrainConfig()
+    config_mode = None
 
-    if args.lr_mp is not None:
-        train_cfg.lr_mp = args.lr_mp
-    if args.lr_vision_backbone is not None:
-        train_cfg.lr_vision_backbone = args.lr_vision_backbone
-    if args.lr_language_backbone is not None:
-        train_cfg.lr_language_backbone = args.lr_language_backbone
-    if args.lr_left_tower is not None:
-        train_cfg.lr_left_tower = args.lr_left_tower
-    if args.lr_right_tower is not None:
-        train_cfg.lr_right_tower = args.lr_right_tower
+    if args.config is not None:
+        try:
+            _validate_config_mode_overrides(sys.argv[1:])
+            config_data = load_yaml_mapping(args.config)
+            validate_allowed_keys(config_data, {"mode", "vlm", "train"}, f"training config '{args.config}'")
+
+            if "mode" in config_data:
+                mode = config_data["mode"]
+                if not isinstance(mode, str):
+                    raise ConfigError(f"Field 'mode' must be a string, got {type(mode).__name__}.")
+                if mode not in {"nanovlm", "dualtower"}:
+                    raise ConfigError("Field 'mode' must be either 'nanovlm' or 'dualtower'.")
+                config_mode = mode
+
+            if "vlm" in config_data:
+                apply_dataclass_overrides(vlm_cfg, config_data["vlm"], "vlm")
+            if "train" in config_data:
+                apply_dataclass_overrides(train_cfg, config_data["train"], "train")
+        except ConfigError as exc:
+            parser.error(str(exc))
+    else:
+        if args.lr_mp is not None:
+            train_cfg.lr_mp = args.lr_mp
+        if args.lr_vision_backbone is not None:
+            train_cfg.lr_vision_backbone = args.lr_vision_backbone
+        if args.lr_language_backbone is not None:
+            train_cfg.lr_language_backbone = args.lr_language_backbone
+        if args.lr_left_tower is not None:
+            train_cfg.lr_left_tower = args.lr_left_tower
+        if args.lr_right_tower is not None:
+            train_cfg.lr_right_tower = args.lr_right_tower
+        if args.vlm_checkpoint_path is not None:
+            vlm_cfg.vlm_checkpoint_path = args.vlm_checkpoint_path
+        if args.left_tower_mask_mode is not None:
+            vlm_cfg.left_tower_mask_mode = args.left_tower_mask_mode
+        if args.compile is not None:
+            train_cfg.compile = args.compile
+        if args.log_wandb is not None:
+            train_cfg.log_wandb = args.log_wandb
+        if args.no_log_wandb is True:
+            train_cfg.log_wandb = False
+        if args.train_dataset_path is not None:
+            train_cfg.train_dataset_path = args.train_dataset_path
+        if args.train_dataset_name is not None:
+            train_cfg.train_dataset_name = tuple(args.train_dataset_name)
+        if args.train_split is not None:
+            train_cfg.train_split = args.train_split
+        if args.val_split is not None:
+            train_cfg.val_split = args.val_split
+        if args.checkpoint_interval is not None:
+            train_cfg.checkpoint_interval = args.checkpoint_interval
+        if args.checkpoint_repo_pattern is not None:
+            train_cfg.checkpoint_repo_pattern = args.checkpoint_repo_pattern
+        if args.no_checkpoint_push:
+            train_cfg.push_checkpoints_to_hub = False
+        if args.no_lmms_eval:
+            train_cfg.use_lmms_eval = False
+        if args.relevance_min_rating is not None:
+            train_cfg.relevance_min_rating = args.relevance_min_rating
+        if args.image_correspondence_min_rating is not None:
+            train_cfg.image_correspondence_min_rating = args.image_correspondence_min_rating
+        if args.visual_dependency_min_rating is not None:
+            train_cfg.visual_dependency_min_rating = args.visual_dependency_min_rating
+        if args.formatting_min_rating is not None:
+            train_cfg.formatting_min_rating = args.formatting_min_rating
+        if args.use_packing is not None:
+            train_cfg.use_packing = args.use_packing
+
+    if args.no_log_wandb is True:
+        train_cfg.log_wandb = False
     if args.vlm_checkpoint_path is not None:
         vlm_cfg.vlm_checkpoint_path = args.vlm_checkpoint_path
     if args.left_tower_mask_mode is not None:
         vlm_cfg.left_tower_mask_mode = args.left_tower_mask_mode
-    if args.compile is not None:
-        train_cfg.compile = args.compile
-    if args.log_wandb is not None:
-        train_cfg.log_wandb = args.log_wandb
-    if args.no_log_wandb is True:
-        train_cfg.log_wandb = False
-    if args.train_dataset_path is not None:
-        train_cfg.train_dataset_path = args.train_dataset_path
-    if args.train_dataset_name is not None:
-        train_cfg.train_dataset_name = tuple(args.train_dataset_name)
-    if args.train_split is not None:
-        train_cfg.train_split = args.train_split
-    if args.val_split is not None:
-        train_cfg.val_split = args.val_split
+    if args.resume_from_vlm_checkpoint:
+        train_cfg.resume_from_vlm_checkpoint = True
     if args.checkpoint_interval is not None:
         train_cfg.checkpoint_interval = args.checkpoint_interval
     if args.checkpoint_repo_pattern is not None:
@@ -1152,24 +1259,17 @@ def main():
         train_cfg.push_checkpoints_to_hub = False
     if args.no_lmms_eval:
         train_cfg.use_lmms_eval = False
-    if args.relevance_min_rating is not None:
-        train_cfg.relevance_min_rating = args.relevance_min_rating
-    if args.image_correspondence_min_rating is not None:
-        train_cfg.image_correspondence_min_rating = args.image_correspondence_min_rating
-    if args.visual_dependency_min_rating is not None:
-        train_cfg.visual_dependency_min_rating = args.visual_dependency_min_rating
-    if args.formatting_min_rating is not None:
-        train_cfg.formatting_min_rating = args.formatting_min_rating
     if args.use_packing is not None:
         train_cfg.use_packing = args.use_packing
 
-    model_mode = "dualtower" if args.dualtower else "nanovlm"
+    model_mode = config_mode if config_mode is not None else "nanovlm"
+    if args.dualtower:
+        model_mode = "dualtower"
     if args.nanovlm:
         model_mode = "nanovlm"
 
-    if args.resume_from_vlm_checkpoint and args.vlm_checkpoint_path is not None:
-        train_cfg.resume_from_vlm_checkpoint = True
-        # When resuming a full VLM, we don't need to load individual backbone weights from original sources
+    if train_cfg.resume_from_vlm_checkpoint and vlm_cfg.vlm_checkpoint_path is not None:
+        # When resuming a full VLM, we don't need to load individual backbone weights from original sources.
         vlm_cfg.vlm_load_backbone_weights = False
 
     if "RANK" in os.environ and "WORLD_SIZE" in os.environ:

@@ -1,0 +1,8 @@
+evaluation:
+  mode: nanovlm
+  model: "lusxvr/nanoVLM-450M"
+  tasks: "mmstar,mme"
+  batch_size: 128
+  output_path: "results/"
+  limit: null
+  device: "cuda"

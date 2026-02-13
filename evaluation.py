@@ -12,7 +12,6 @@ from functools import partial
 
 import numpy as np
 import torch
-import yaml
 
 warnings.simplefilter("ignore", category=DeprecationWarning)
 
@@ -37,7 +36,14 @@ from lmms_eval.utils import (
 )
 
 from eval.lmms_eval_wrapper import DualTowerWrapper, NanoVLMWrapper
+from train_utils.config_loader import (
+    ConfigError,
+    load_named_section,
+    validate_allowed_keys,
+)
+from train_utils.env import load_project_dotenv
 
+load_project_dotenv()
 
 def _int_or_none_list_arg_type(min_len: int, max_len: int, defaults: str, value: str, split_char: str = ","):
     def parse_value(item):
@@ -130,7 +136,140 @@ def _build_wrapped_model(args):
     )
 
 
-def parse_eval_args() -> argparse.Namespace:
+def _validate_eval_override(action: argparse.Action, value, key_name: str):
+    if value is None and action.default is None:
+        return None
+
+    if isinstance(action, (argparse._StoreTrueAction, argparse._StoreFalseAction)):
+        if not isinstance(value, bool):
+            raise ConfigError(f"Field '{key_name}' expects bool, got {type(value).__name__}.")
+        return value
+
+    if action.nargs in ("*", "+"):
+        if not isinstance(value, list):
+            raise ConfigError(f"Field '{key_name}' expects a list, got {type(value).__name__}.")
+        if action.type is None:
+            return value
+
+        validated_items = []
+        for idx, item in enumerate(value):
+            if action.type is int:
+                if not isinstance(item, int) or isinstance(item, bool):
+                    raise ConfigError(
+                        f"Field '{key_name}[{idx}]' expects int, got {type(item).__name__}."
+                    )
+                validated_items.append(item)
+            elif action.type is float:
+                if not isinstance(item, (int, float)) or isinstance(item, bool):
+                    raise ConfigError(
+                        f"Field '{key_name}[{idx}]' expects float, got {type(item).__name__}."
+                    )
+                validated_items.append(float(item))
+            elif action.type is str:
+                if not isinstance(item, str):
+                    raise ConfigError(
+                        f"Field '{key_name}[{idx}]' expects str, got {type(item).__name__}."
+                    )
+                validated_items.append(item)
+            else:
+                raise ConfigError(
+                    f"Field '{key_name}[{idx}]' uses unsupported parser type '{action.type}'. "
+                    "Use CLI for this field."
+                )
+        return validated_items
+
+    if action.type is int:
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise ConfigError(f"Field '{key_name}' expects int, got {type(value).__name__}.")
+        return value
+    if action.type is float:
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            raise ConfigError(f"Field '{key_name}' expects float, got {type(value).__name__}.")
+        return float(value)
+    if action.type is str:
+        if key_name == "batch_size" and isinstance(value, int) and not isinstance(value, bool):
+            value = str(value)
+        if not isinstance(value, str):
+            raise ConfigError(f"Field '{key_name}' expects str, got {type(value).__name__}.")
+        return value
+    if action.type is not None:
+        if key_name == "seed":
+            if isinstance(value, list):
+                return value
+            if not isinstance(value, str):
+                raise ConfigError(
+                    f"Field '{key_name}' expects either a seed string or list, got {type(value).__name__}."
+                )
+            return action.type(value)
+        raise ConfigError(
+            f"Field '{key_name}' uses unsupported parser type '{action.type}'. "
+            "Use CLI for this field."
+        )
+
+    default = action.default
+    if default is None:
+        return value
+    if isinstance(default, bool):
+        if not isinstance(value, bool):
+            raise ConfigError(f"Field '{key_name}' expects bool, got {type(value).__name__}.")
+        return value
+    if isinstance(default, int) and not isinstance(default, bool):
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise ConfigError(f"Field '{key_name}' expects int, got {type(value).__name__}.")
+        return value
+    if isinstance(default, float):
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            raise ConfigError(f"Field '{key_name}' expects float, got {type(value).__name__}.")
+        return float(value)
+    if isinstance(default, str):
+        if not isinstance(value, str):
+            raise ConfigError(f"Field '{key_name}' expects str, got {type(value).__name__}.")
+        return value
+    return value
+
+
+def _load_eval_config_overrides(config_path: str, parser: argparse.ArgumentParser) -> dict:
+    config_overrides = load_named_section(
+        config_path,
+        section_name="evaluation",
+        allow_flat_mapping=True,
+    )
+    action_map = {
+        action.dest: action
+        for action in parser._actions
+        if action.dest != "help"
+    }
+    allowed_keys = set(action_map.keys()) - {"config"}
+    validate_allowed_keys(
+        config_overrides,
+        allowed_keys,
+        f"evaluation config '{config_path}'",
+    )
+
+    validated: dict[str, object] = {}
+    for key, value in config_overrides.items():
+        action = action_map[key]
+        validated_value = _validate_eval_override(action, value, key)
+        if action.choices is not None:
+            if isinstance(validated_value, list):
+                invalid_items = [item for item in validated_value if item not in action.choices]
+                if invalid_items:
+                    allowed_choices = ", ".join(str(choice) for choice in action.choices)
+                    invalid_text = ", ".join(str(item) for item in invalid_items)
+                    raise ConfigError(
+                        f"Field '{key}' has invalid values ({invalid_text}). "
+                        f"Allowed values: {allowed_choices}."
+                    )
+            elif validated_value not in action.choices:
+                allowed_choices = ", ".join(str(choice) for choice in action.choices)
+                raise ConfigError(
+                    f"Field '{key}' has invalid value '{validated_value}'. Allowed values: {allowed_choices}."
+                )
+        validated[key] = validated_value
+    return validated
+
+
+def build_eval_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(formatter_class=argparse.RawTextHelpFormatter)
     parser.add_argument(
         "--mode",
@@ -139,7 +278,14 @@ def parse_eval_args() -> argparse.Namespace:
         choices=["nanovlm", "dualtower"],
         help="Evaluation mode. Selects the wrapper and expected model_args.",
     )
-    parser.add_argument("--config", default="", help="Path to a yaml file specifying all eval arguments, will ignore cli arguments if specified")
+    parser.add_argument(
+        "--config",
+        default="",
+        help=(
+            "Path to a YAML config file. Accepts either a top-level 'evaluation:' section "
+            "or a flat mapping of evaluation arguments."
+        ),
+    )
     parser.add_argument("--model", default="hf", help="Name of model e.g. `hf`")
     parser.add_argument(
         "--tasks",
@@ -334,11 +480,17 @@ def parse_eval_args() -> argparse.Namespace:
     parser.add_argument("--eval_tasks", type=str, nargs='+', default=None, help="List of evaluation tasks to run.")
     parser.add_argument("--eval_results_dir", default="eval_results", help="Directory for evaluation results")
     parser.add_argument("--force", action="store_true", help="Force re-run evaluations, ignoring existing results")
+    return parser
+
+
+def parse_eval_args() -> argparse.Namespace:
+    parser = build_eval_parser()
     args = parser.parse_args()
     return args
     
 def cli_evaluate(args: Union[argparse.Namespace, None] = None) -> None:
-    default_args = parse_eval_args()
+    parser = build_eval_parser()
+    default_args = parser.parse_args()
 
     if args is None and len(sys.argv) == 1:
         print("┌───────────────────────────────────────────────────────────────────────────────┐")
@@ -372,18 +524,15 @@ def cli_evaluate(args: Union[argparse.Namespace, None] = None) -> None:
     args_list = []
     results_list = []
     if args.config:
-        if not os.path.exists(args.config):
-            raise ValueError(f"Config file does not exist: {args.config}")
+        try:
+            config_overrides = _load_eval_config_overrides(args.config, parser)
+        except ConfigError as exc:
+            raise ValueError(str(exc)) from exc
 
-        with open(args.config, "r") as file:
-            config_args = yaml.safe_load(file)
-        config_args = [config_args] if type(config_args) != list else config_args
-        # multiple configs, create args list first
-        for config in config_args:
-            args_copy = argparse.Namespace(**vars(args))
-            for key, value in config.items():
-                setattr(args_copy, key, value)
-            args_list.append(args_copy)
+        args_copy = argparse.Namespace(**vars(args))
+        for key, value in config_overrides.items():
+            setattr(args_copy, key, value)
+        args_list.append(args_copy)
     else:
         args_list.append(args)
 

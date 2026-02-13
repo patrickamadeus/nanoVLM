@@ -67,6 +67,21 @@ pip install torch numpy torchvision pillow datasets huggingface-hub transformers
 # Optional: for lmms-eval integration you have to install it from source, see section 'Evaluation with lmms-eval'
 
 ```
+### Environment Variables with `.env`
+
+Python entrypoints in this repo automatically load a `.env` file from the current working directory (or parent directories) via `python-dotenv`.
+
+Create your local env file:
+```bash
+cp .env.example .env
+```
+Then set values like:
+```bash
+HF_TOKEN=...
+WANDB_API_KEY=...
+HF_HOME=/workspace/huggingface
+```
+
 Dependencies: 
 - `torch` <3
 - `numpy` <3
@@ -86,6 +101,16 @@ huggingface-cli login
 python train.py
 ```
 which will use the default `models/config.py`.
+
+For reproducible experiment runs, you can provide a single YAML config file:
+```bash
+source .venv/bin/activate
+python train.py --config configs/train.example.yaml
+```
+`train.py --config` expects top-level keys `mode`, `vlm`, and `train`.
+When `--config` is set, only `--nanovlm` or `--dualtower` can override the config mode from CLI; other train overrides must be set in the YAML file.
+To prefix generated W&B run names while keeping the default naming scheme, set `train.wandb_run_name_prefix` in your config (for example: `wandb_run_name_prefix: "debug"`).
+To set the W&B project from config, set `train.wandb_project` (for example: `wandb_project: "my-project"`).
 
 To explicitly select architecture mode:
 ```bash
@@ -166,6 +191,9 @@ python evaluation.py --mode nanovlm --model lusxvr/nanoVLM-450M --tasks mmstar,m
 # Evaluate a DualTower checkpoint/repo
 python evaluation.py --mode dualtower --model <dualtower-repo-or-checkpoint-path> --tasks mmstar,mme
 
+# Evaluate using a YAML config file
+python evaluation.py --config configs/eval.example.yaml
+
 # If you want to use it during training, simply import the module and call it just as you would from the command line.
 # You can pass all the arguments you can also pass in the command line.
 # The evaluation during training works in the full DDP setup.
@@ -177,6 +205,8 @@ args = argparse.Namespace(
 )
 results = cli_evaluate(args)
 ```
+`evaluation.py --config` accepts either a top-level `evaluation:` section or a flat mapping of evaluation arguments.
+Unknown config keys fail fast with an explicit error.
 
 ## Hub integration
 

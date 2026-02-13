@@ -1,6 +1,9 @@
 import argparse
 import torch
 from PIL import Image
+from train_utils.env import load_project_dotenv
+
+load_project_dotenv()
 
 torch.manual_seed(0)
 if torch.cuda.is_available():
