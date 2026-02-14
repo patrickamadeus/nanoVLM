@@ -26,4 +26,6 @@ This brings all the individual parts together and handles the concatenation of i
 
 Dual-tower architecture is available under `models/dual_tower/`:
 - `dual_tower.py`: left/right tower orchestration and hub save/load helpers
-- `dual_language_model.py`: language model variant used by the right tower with dual-prefill KV replacement support
+- the right tower now reuses the shared `models/language_model.py` implementation with a minimal dual-prefill KV override hook in attention.
+- left tower prefill mask is configurable via `cfg.left_tower_mask_mode`:
+  `visual_only` (default), `visual_plus_prefix`, or `full`.

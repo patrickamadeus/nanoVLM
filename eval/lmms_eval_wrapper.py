@@ -543,54 +543,6 @@ class DualTowerWrapper(lmms):
 
         return context_str, prompt
 
-    def _left_pad(self, seq: torch.Tensor, max_len: int, pad_value: int) -> torch.Tensor:
-        if seq.numel() >= max_len:
-            return seq
-        return torch.nn.functional.pad(seq, (max_len - seq.numel(), 0), value=pad_value)
-
-    def _right_pad(self, seq: torch.Tensor, max_len: int, pad_value: int) -> torch.Tensor:
-        if seq.numel() >= max_len:
-            return seq
-        return torch.nn.functional.pad(seq, (0, max_len - seq.numel()), value=pad_value)
-
-    def _center_pad_batch(
-        self,
-        input_ids_list: List[torch.Tensor],
-        attention_mask_list: List[torch.Tensor],
-        split_points: List[int],
-    ) -> Tuple[torch.Tensor, torch.Tensor, int]:
-        left_ids, right_ids = [], []
-        left_masks, right_masks = [], []
-        max_left, max_right = 0, 0
-        for ids, mask, split in zip(input_ids_list, attention_mask_list, split_points):
-            left = ids[:split]
-            right = ids[split:]
-            left_mask = mask[:split]
-            right_mask = mask[split:]
-            left_ids.append(left)
-            right_ids.append(right)
-            left_masks.append(left_mask)
-            right_masks.append(right_mask)
-            max_left = max(max_left, left.numel())
-            max_right = max(max_right, right.numel())
-
-        left_ids_padded = [self._right_pad(seq, max_left, self.tokenizer.pad_token_id) for seq in left_ids]
-        right_ids_padded = [self._left_pad(seq, max_right, self.tokenizer.pad_token_id) for seq in right_ids]
-        left_masks_padded = [self._right_pad(seq, max_left, 0) for seq in left_masks]
-        right_masks_padded = [self._left_pad(seq, max_right, 0) for seq in right_masks]
-
-        input_ids = [torch.cat([l, r], dim=0) for l, r in zip(left_ids_padded, right_ids_padded)]
-        attention_mask = [torch.cat([l, r], dim=0) for l, r in zip(left_masks_padded, right_masks_padded)]
-
-        return torch.stack(input_ids), torch.stack(attention_mask), max_left - 1
-
-    def _find_last_image_token_pos(self, input_ids: torch.Tensor) -> int:
-        image_token_id = self.tokenizer.encode(self.tokenizer.image_token, add_special_tokens=False)[0]
-        positions = (input_ids == image_token_id).nonzero(as_tuple=False)
-        if positions.numel() == 0:
-            raise ValueError("No image token found in the prompt.")
-        return int(positions[-1].item())
-
     def generate_until(self, requests: List[Instance]) -> List[str]:
         res = []
 
@@ -638,23 +590,17 @@ class DualTowerWrapper(lmms):
             for i in range(len(prompts)):
                 _, prompts[i] = self.apply_benchmark_formatting("", prompts[i], task[i])
 
-            tokenized = self.tokenizer(
+            inputs = self.tokenizer(
                 prompts,
-                return_attention_mask=True,
-                padding=False,
+                return_tensors="pt",
+                padding="longest",
+                padding_side="left",
                 truncation=True,
                 max_length=self.max_length,
-                add_special_tokens=False,
+                add_special_tokens=False
             )
-            input_ids_list = [torch.tensor(ids, dtype=torch.long) for ids in tokenized["input_ids"]]
-            attention_mask_list = [torch.tensor(mask, dtype=torch.long) for mask in tokenized["attention_mask"]]
-
-            split_points = [self._find_last_image_token_pos(ids) + 1 for ids in input_ids_list]
-            input_ids, attention_mask, last_img_idx = self._center_pad_batch(
-                input_ids_list, attention_mask_list, split_points
-            )
-            input_ids = input_ids.to(self.device)
-            attention_mask = attention_mask.to(self.device)
+            input_ids = inputs["input_ids"].to(self.device)
+            attention_mask = inputs["attention_mask"].to(self.device)
 
             current_gen_kwargs = all_gen_kwargs[0] if all_gen_kwargs else {}
             max_new_tokens = current_gen_kwargs.get("max_new_tokens", 50)
@@ -667,7 +613,6 @@ class DualTowerWrapper(lmms):
                 input_ids=input_ids,
                 images=images,
                 attention_mask=attention_mask,
-                last_img_idx=last_img_idx,
                 max_new_tokens=max_new_tokens,
                 top_k=top_k,
                 top_p=top_p,

@@ -31,8 +31,8 @@ from data.advanced_datasets import ConstantLengthDataset
 from data.processors import get_image_processor, get_tokenizer
 
 import models.config as config
+from models.language_model import LanguageModel
 from models.vision_language_model import VisionLanguageModel
-from models.dual_tower.dual_language_model import LanguageModel as DualLanguageModel
 from models.dual_tower.dual_tower import DualTowerVLM
 from train_utils.console import ctext, log_debug, log_info, log_success, log_warn, progress_color
 
@@ -169,6 +169,8 @@ def get_dataloaders(train_cfg, vlm_cfg):
         raise ValueError(
             f"max_sample_length ({train_cfg.max_sample_length}) must be <= lm_max_length ({vlm_cfg.lm_max_length})"
         )
+    if not train_cfg.use_packing and train_cfg.stream_dataset:
+        raise ValueError("stream_dataset=True requires use_packing=True in the current dataloader pipeline.")
     # Create datasets
     image_processor = get_image_processor(vlm_cfg.max_img_size, vlm_cfg.vit_img_size, vlm_cfg.resize_to_max_side_len)
     tokenizer = get_tokenizer(
@@ -253,14 +255,32 @@ def get_dataloaders(train_cfg, vlm_cfg):
         train_cfg.formatting_min_rating,
     )
 
-    train_dataset = ConstantLengthDataset(train_dataset, infinite=False, max_sample_length=train_cfg.max_sample_length, seq_length=vlm_cfg.lm_max_length, num_of_sequences=train_cfg.batch_size*4, queue_size=4,
-                                        max_images_per_example=train_cfg.max_images_per_example, max_images_per_knapsack=train_cfg.max_images_per_knapsack)
+    if train_cfg.use_packing:
+        train_dataset = ConstantLengthDataset(
+            train_dataset,
+            infinite=False,
+            max_sample_length=train_cfg.max_sample_length,
+            seq_length=vlm_cfg.lm_max_length,
+            num_of_sequences=train_cfg.batch_size * 4,
+            queue_size=2,
+            max_images_per_example=train_cfg.max_images_per_example,
+            max_images_per_knapsack=train_cfg.max_images_per_knapsack,
+        )
 
-    val_dataset = ConstantLengthDataset(val_dataset, infinite=False, max_sample_length=train_cfg.max_sample_length, seq_length=vlm_cfg.lm_max_length, num_of_sequences=train_cfg.batch_size*4, queue_size=4,
-                                        max_images_per_example=train_cfg.max_images_per_example, max_images_per_knapsack=train_cfg.max_images_per_knapsack)
+        val_dataset = ConstantLengthDataset(
+            val_dataset,
+            infinite=False,
+            max_sample_length=train_cfg.max_sample_length,
+            seq_length=vlm_cfg.lm_max_length,
+            num_of_sequences=train_cfg.batch_size * 4,
+            queue_size=2,
+            max_images_per_example=train_cfg.max_images_per_example,
+            max_images_per_knapsack=train_cfg.max_images_per_knapsack,
+        )
 
     # Create collators
-    vqa_collator = VQACollator(tokenizer, vlm_cfg.lm_max_length)
+    collator_max_len = vlm_cfg.lm_max_length if train_cfg.use_packing else train_cfg.max_sample_length
+    vqa_collator = VQACollator(tokenizer, collator_max_len)
 
     g = torch.Generator()
     g.manual_seed(0)
@@ -271,7 +291,7 @@ def get_dataloaders(train_cfg, vlm_cfg):
         train_dataset,
         batch_size=train_cfg.batch_size,    # =per device BS in DDP
         collate_fn=vqa_collator,
-        num_workers=2,
+        num_workers=1,
         pin_memory=False,
         persistent_workers=False,
         drop_last=True,
@@ -283,7 +303,7 @@ def get_dataloaders(train_cfg, vlm_cfg):
         val_dataset,
         batch_size=train_cfg.batch_size,
         collate_fn=vqa_collator,
-        num_workers=2,
+        num_workers=1,
         pin_memory=False,
         persistent_workers=False,
         drop_last=True,
@@ -430,7 +450,7 @@ def train(train_cfg, vlm_cfg, model_mode: str = "nanovlm"):
             model.left_tower.vision_encoder.load_state_dict(vlm_model.vision_encoder.state_dict())
             model.left_tower.MP.load_state_dict(vlm_model.MP.state_dict())
             model.left_tower.decoder.load_state_dict(vlm_model.decoder.state_dict())
-            right_lm = DualLanguageModel.from_pretrained(vlm_cfg)
+            right_lm = LanguageModel.from_pretrained(vlm_cfg)
             model.right_tower.load_state_dict(right_lm.state_dict())
             del right_lm
             del vlm_model
@@ -1059,6 +1079,12 @@ def main():
     parser.add_argument('--lr_left_tower', type=float, help='DualTower: learning rate for the left tower language decoder')
     parser.add_argument('--lr_right_tower', type=float, help='DualTower: learning rate for the right tower')
     parser.add_argument('--vlm_checkpoint_path', type=str, help='Path or repo ID of the VLM checkpoint for loading')
+    parser.add_argument(
+        '--left_tower_mask_mode',
+        type=str,
+        choices=['visual_only', 'visual_plus_prefix', 'full'],
+        help='DualTower left-tower mask mode: visual_only, visual_plus_prefix, or full',
+    )
     parser.add_argument('--compile', type=bool, help='Use torch.compile to optimize the model')
     parser.add_argument('--log_wandb', type=bool, help='Log to wandb')
     parser.add_argument('--resume_from_vlm_checkpoint', type=bool, default=False, help='Resume training from VLM checkpoint specified by vlm_checkpoint_path (or default if not provided)')
@@ -1075,6 +1101,10 @@ def main():
     parser.add_argument('--image_correspondence_min_rating', type=int, help='Minimum image correspondence rating of images per sample')
     parser.add_argument('--visual_dependency_min_rating', type=int, help='Minimum visual dependency rating of images per sample')
     parser.add_argument('--formatting_min_rating', type=int, help='Minimum formatting rating of images per sample')
+    packing_group = parser.add_mutually_exclusive_group()
+    packing_group.add_argument('--packing', dest='use_packing', action='store_true', help='Enable packed training samples (default).')
+    packing_group.add_argument('--no_packing', dest='use_packing', action='store_false', help='Disable sample packing and train on single samples.')
+    parser.set_defaults(use_packing=None)
     mode_group = parser.add_mutually_exclusive_group()
     mode_group.add_argument('--dualtower', action='store_true', help='Use DualTowerVLM architecture')
     mode_group.add_argument('--nanovlm', action='store_true', help='Use nanoVLM architecture (default)')
@@ -1096,6 +1126,8 @@ def main():
         train_cfg.lr_right_tower = args.lr_right_tower
     if args.vlm_checkpoint_path is not None:
         vlm_cfg.vlm_checkpoint_path = args.vlm_checkpoint_path
+    if args.left_tower_mask_mode is not None:
+        vlm_cfg.left_tower_mask_mode = args.left_tower_mask_mode
     if args.compile is not None:
         train_cfg.compile = args.compile
     if args.log_wandb is not None:
@@ -1126,6 +1158,8 @@ def main():
         train_cfg.visual_dependency_min_rating = args.visual_dependency_min_rating
     if args.formatting_min_rating is not None:
         train_cfg.formatting_min_rating = args.formatting_min_rating
+    if args.use_packing is not None:
+        train_cfg.use_packing = args.use_packing
 
     model_mode = "dualtower" if args.dualtower else "nanovlm"
     if args.nanovlm:

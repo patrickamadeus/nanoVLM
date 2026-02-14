@@ -97,8 +97,24 @@ For DualTower, you can explicitly set separate left/right tower learning rates:
 ```bash
 python train.py --dualtower --lr_left_tower 1e-5 --lr_right_tower 5e-6
 ```
+Packing is enabled by default. To disable packing and train on single samples:
+```bash
+python train.py --no_packing
+```
+To explicitly enable packing:
+```bash
+python train.py --packing
+```
 When resuming DualTower from `--vlm_checkpoint_path`, training initializes the right tower from `lm_model_type` (fresh HF LM init) and does not copy vanilla `decoder.*` checkpoint weights into the right tower.
 `DualTowerVLM.from_pretrained(...)` now performs strict dualtower checkpoint loading (`model.safetensors` + `config.json`) without automatic key remapping from vanilla nanoVLM checkpoints. For vanilla-to-dualtower initialization, use `--resume_from_vlm_checkpoint` in training.
+DualTower left-tower prefill uses a visual-only attention mask derived from `vlm_extra_tokens`; right tower consumes the full sequence and receives left-tower K/V on visual positions during dual prefill.
+You can choose the left-tower masking policy with:
+```bash
+python train.py --dualtower --left_tower_mask_mode visual_only
+python train.py --dualtower --left_tower_mask_mode visual_plus_prefix
+python train.py --dualtower --left_tower_mask_mode full
+```
+`visual_only` masks left tower to visual-structure tokens only (default), `visual_plus_prefix` also includes tokens before the first visual token in each packed segment, and `full` uses the full attention mask.
 
 `train.py` computes loss with `loss_reduction="sum"` and normalizes updates/metrics by the number of valid target tokens (`labels != -100`) across gradient accumulation (and across all ranks in DDP).
 When logging, `train/batch_loss` is the current microbatch token-normalized loss, and `train/step_loss` is the token-normalized loss used for the optimizer step.
