@@ -125,7 +125,10 @@ def wrap_model(model):
 
 def get_run_name(train_cfg, vlm_cfg):
     batch_size = f"bs{int(train_cfg.batch_size*get_world_size()*train_cfg.gradient_accumulation_steps)}"
-    max_training_steps = f"{train_cfg.max_training_steps}"
+    if getattr(train_cfg, "stop_unit", "steps") == "tokens" and getattr(train_cfg, "max_training_tokens", None) is not None:
+        max_training_steps = f"{train_cfg.max_training_tokens}tok"
+    else:
+        max_training_steps = f"{train_cfg.max_training_steps}"
     learning_rate = f"lr_vision_{train_cfg.lr_vision_backbone}-language_{train_cfg.lr_language_backbone}-{train_cfg.lr_mp}"
     num_gpus = f"{get_world_size()}xGPU"
     date = time.strftime("%m%d-%H%M%S")
@@ -379,6 +382,77 @@ def compute_effective_token_ratio(effective_tokens: float, token_capacity: float
     return float(effective_tokens) / token_capacity_value
 
 
+_SCHEDULE_UNITS = {"steps", "tokens"}
+
+
+def _normalize_schedule_unit(unit: str, field_name: str) -> str:
+    if unit not in _SCHEDULE_UNITS:
+        allowed = ", ".join(sorted(_SCHEDULE_UNITS))
+        raise ValueError(f"{field_name} must be one of {{{allowed}}}, got '{unit}'.")
+    return unit
+
+
+def _validate_training_schedule_config(train_cfg):
+    stop_unit = _normalize_schedule_unit(train_cfg.stop_unit, "stop_unit")
+    eval_unit = _normalize_schedule_unit(train_cfg.eval_unit, "eval_unit")
+    checkpoint_unit = _normalize_schedule_unit(train_cfg.checkpoint_unit, "checkpoint_unit")
+
+    if train_cfg.stats_log_interval <= 0:
+        raise ValueError("stats_log_interval must be > 0.")
+
+    if stop_unit == "steps":
+        if train_cfg.max_training_steps <= 0:
+            raise ValueError("max_training_steps must be > 0 when stop_unit='steps'.")
+    else:
+        if train_cfg.max_training_tokens is None or train_cfg.max_training_tokens <= 0:
+            raise ValueError("max_training_tokens must be > 0 when stop_unit='tokens'.")
+
+    if eval_unit == "steps":
+        if train_cfg.eval_interval <= 0:
+            raise ValueError("eval_interval must be > 0 when eval_unit='steps'.")
+    else:
+        if train_cfg.eval_interval_tokens is None or train_cfg.eval_interval_tokens <= 0:
+            raise ValueError("eval_interval_tokens must be > 0 when eval_unit='tokens'.")
+
+    if checkpoint_unit == "steps":
+        if train_cfg.checkpoint_interval <= 0:
+            raise ValueError("checkpoint_interval must be > 0 when checkpoint_unit='steps'.")
+    else:
+        if train_cfg.checkpoint_interval_tokens is None or train_cfg.checkpoint_interval_tokens <= 0:
+            raise ValueError("checkpoint_interval_tokens must be > 0 when checkpoint_unit='tokens'.")
+
+    return {
+        "stop_unit": stop_unit,
+        "eval_unit": eval_unit,
+        "checkpoint_unit": checkpoint_unit,
+    }
+
+
+def _advance_token_trigger(global_tokens: int, next_trigger_tokens: int | None, interval_tokens: int | None):
+    if next_trigger_tokens is None or interval_tokens is None:
+        raise ValueError("Token trigger requires initialized threshold and interval.")
+    if global_tokens < next_trigger_tokens:
+        return False, next_trigger_tokens
+    while global_tokens >= next_trigger_tokens:
+        next_trigger_tokens += interval_tokens
+    return True, next_trigger_tokens
+
+
+def _should_stop_training(global_step: int, global_tokens: int, train_cfg, schedule_units: dict[str, str]) -> bool:
+    if schedule_units["stop_unit"] == "steps":
+        return global_step >= train_cfg.max_training_steps
+    return global_tokens >= train_cfg.max_training_tokens
+
+
+def _progress_text(global_step: int, global_tokens: int, train_cfg, schedule_units: dict[str, str]) -> str:
+    if schedule_units["stop_unit"] == "steps":
+        return progress_color(global_step, train_cfg.max_training_steps)
+    return (
+        f"step {ctext(str(global_step), 'yellow', attrs=('bold',))} | "
+        f"tokens {ctext(f'{global_tokens:,}/{train_cfg.max_training_tokens:,}', 'yellow', attrs=('bold',))}"
+    )
+
+
 def _base_model(model):
     return model.module if hasattr(model, "module") else model
 
@@ -514,13 +588,12 @@ def _maybe_mark_batch_dynamic(*, input_ids: torch.Tensor, labels: torch.Tensor, 
 
 
 def train(train_cfg, vlm_cfg, model_mode: str = "nanovlm"):
-    if train_cfg.checkpoint_interval <= 0:
-        raise ValueError("checkpoint_interval must be > 0.")
+    schedule_units = _validate_training_schedule_config(train_cfg)
     try:
-        train_cfg.checkpoint_repo_pattern.format(step=1, i=1)
+        train_cfg.checkpoint_repo_pattern.format(step=1, i=1, tokens=1)
     except Exception as e:
         raise ValueError(
-            "checkpoint_repo_pattern must be a valid format string containing '{step}' or '{i}'."
+            "checkpoint_repo_pattern must be a valid format string containing '{step}' or '{i}' (optional '{tokens}')."
         ) from e
     if train_cfg.use_lmms_eval:
         raise ValueError(
@@ -567,6 +640,15 @@ def train(train_cfg, vlm_cfg, model_mode: str = "nanovlm"):
         run.define_metric("val_loss", step_metric="train/consumed_tokens")
         run.define_metric("checkpoint/pushed", step_metric="train/consumed_tokens")
         run.define_metric("grad_norm", step_metric="train/consumed_tokens")
+        run.log(
+            {
+                "train/consumed_tokens": 0,
+                "schedule/stop_unit": schedule_units["stop_unit"],
+                "schedule/eval_unit": schedule_units["eval_unit"],
+                "schedule/checkpoint_unit": schedule_units["checkpoint_unit"],
+            },
+            step=0,
+        )
 
     # Initialize model
     if train_cfg.resume_from_vlm_checkpoint:
@@ -756,6 +838,12 @@ def train(train_cfg, vlm_cfg, model_mode: str = "nanovlm"):
     global_step = 0
     global_consumed_tokens = 0
     epoch = 0
+    next_eval_tokens = train_cfg.eval_interval_tokens if schedule_units["eval_unit"] == "tokens" else None
+    next_checkpoint_tokens = (
+        train_cfg.checkpoint_interval_tokens
+        if schedule_units["checkpoint_unit"] == "tokens"
+        else None
+    )
     
     # Training stats accumulators
     accumulated_stats = {
@@ -767,7 +855,9 @@ def train(train_cfg, vlm_cfg, model_mode: str = "nanovlm"):
         'effective_token_ratio': [],
     }
     
-    while global_step < train_cfg.max_training_steps:
+    while True:
+        if _should_stop_training(global_step, global_consumed_tokens, train_cfg, schedule_units):
+            break
         epoch += 1
         epoch_start_time = time.time()
         model.train()
@@ -780,9 +870,12 @@ def train(train_cfg, vlm_cfg, model_mode: str = "nanovlm"):
         accumulated_effective_tokens_for_update_local = 0
         accumulated_token_capacity_for_update_local = 0
         data_load_start = time.time()
+        stop_training = False
 
         log_info(f"Starting training loop for epoch {ctext(epoch, 'cyan', attrs=('bold',))}")
-        remaining_steps = train_cfg.max_training_steps - global_step
+        remaining_steps = None
+        if schedule_units["stop_unit"] == "steps":
+            remaining_steps = max(train_cfg.max_training_steps - global_step, 0)
         step_progress = tqdm(
             total=remaining_steps,
             desc=f"Epoch {epoch}",
@@ -957,14 +1050,20 @@ def train(train_cfg, vlm_cfg, model_mode: str = "nanovlm"):
                     raise ValueError("Missing step effective-token count on update step.")
                 global_consumed_tokens += step_effective_tokens_value
             
-            if (
-                train_cfg.eval_in_epochs
-                and is_update_step
-                and step_after_update % train_cfg.eval_interval == 0
-            ):
+            should_run_eval = False
+            if train_cfg.eval_in_epochs and is_update_step:
+                if schedule_units["eval_unit"] == "steps":
+                    should_run_eval = (step_after_update % train_cfg.eval_interval == 0)
+                else:
+                    should_run_eval, next_eval_tokens = _advance_token_trigger(
+                        global_consumed_tokens,
+                        next_eval_tokens,
+                        train_cfg.eval_interval_tokens,
+                    )
+
+            if should_run_eval:
                 log_info(
-                    f"Starting evaluation at step "
-                    f"{progress_color(step_after_update, train_cfg.max_training_steps)}"
+                    f"Starting evaluation at {_progress_text(step_after_update, global_consumed_tokens, train_cfg, schedule_units)}"
                 )
                 model.eval()
                 if device.type == "cuda":
@@ -1030,7 +1129,7 @@ def train(train_cfg, vlm_cfg, model_mode: str = "nanovlm"):
                     
                     if is_master():
                         log_info(
-                            f"Validation {progress_color(step_after_update, train_cfg.max_training_steps)} | "
+                            f"Validation {_progress_text(step_after_update, global_consumed_tokens, train_cfg, schedule_units)} | "
                             f"Val Loss: {ctext(f'{avg_val_loss:.4f}', 'yellow', attrs=('bold',))} | "
                             f"Tokens/s: {ctext(f'{tokens_per_second:.2f}', 'yellow', attrs=('bold',))}"
                         )
@@ -1045,20 +1144,26 @@ def train(train_cfg, vlm_cfg, model_mode: str = "nanovlm"):
 
                 model.train()
 
-            if (
-                is_update_step
-                and train_cfg.push_checkpoints_to_hub
-                and step_after_update % train_cfg.checkpoint_interval == 0
-                and is_master()
-            ):
+            should_push_checkpoint = False
+            if is_update_step and train_cfg.push_checkpoints_to_hub and is_master():
+                if schedule_units["checkpoint_unit"] == "steps":
+                    should_push_checkpoint = (step_after_update % train_cfg.checkpoint_interval == 0)
+                else:
+                    should_push_checkpoint, next_checkpoint_tokens = _advance_token_trigger(
+                        global_consumed_tokens,
+                        next_checkpoint_tokens,
+                        train_cfg.checkpoint_interval_tokens,
+                    )
+
+            if should_push_checkpoint:
                 checkpoint_repo_id = train_cfg.checkpoint_repo_pattern.format(
                     step=step_after_update,
                     i=step_after_update,
+                    tokens=global_consumed_tokens,
                 )
                 save_model = model.module if is_dist() else model
                 log_info(
-                    f"Pushing checkpoint for step "
-                    f"{progress_color(step_after_update, train_cfg.max_training_steps)} "
+                    f"Pushing checkpoint at {_progress_text(step_after_update, global_consumed_tokens, train_cfg, schedule_units)} "
                     f"to {ctext(checkpoint_repo_id, 'cyan')}"
                 )
                 save_model.push_to_hub(
@@ -1205,7 +1310,8 @@ def train(train_cfg, vlm_cfg, model_mode: str = "nanovlm"):
                 global_step = step_after_update
                 if is_master():
                     step_progress.update(1)
-                if global_step >= train_cfg.max_training_steps:
+                if _should_stop_training(global_step, global_consumed_tokens, train_cfg, schedule_units):
+                    stop_training = True
                     break
             data_load_start = time.time()
 
@@ -1241,11 +1347,14 @@ def train(train_cfg, vlm_cfg, model_mode: str = "nanovlm"):
 
             log_info(
                 f"Epoch {ctext(epoch, 'cyan', attrs=('bold',))} | "
-                f"Step {progress_color(global_step, train_cfg.max_training_steps)} | "
+                f"Progress {_progress_text(global_step, global_consumed_tokens, train_cfg, schedule_units)} | "
                 f"Train Loss: {ctext(f'{avg_train_loss:.4f}', 'yellow', attrs=('bold',))} | "
                 f"Time: {epoch_duration:.2f}s | "
                 f"T/s: {ctext(f'{epoch_tokens_per_second:.2f}', 'yellow', attrs=('bold',))}"
             )
+
+        if stop_training:
+            break
 
     # Summary Statistics
     if is_master():
@@ -1306,7 +1415,13 @@ def main():
             "--train_dataset_name",
             "--train_split",
             "--val_split",
+            "--stop_unit",
+            "--max_training_tokens",
+            "--eval_unit",
+            "--eval_interval_tokens",
             "--checkpoint_interval",
+            "--checkpoint_unit",
+            "--checkpoint_interval_tokens",
             "--checkpoint_repo_pattern",
             "--no_checkpoint_push",
             "--no_lmms_eval",
@@ -1352,8 +1467,14 @@ def main():
     parser.add_argument('--train_dataset_name', nargs='+', type=str, help='Dataset config names to load (use "default" for single-config datasets)')
     parser.add_argument('--train_split', type=str, help='Dataset split name for training data')
     parser.add_argument('--val_split', type=str, help='Dataset split name for validation data')
+    parser.add_argument('--stop_unit', type=str, choices=['steps', 'tokens'], help="Training stop unit: 'steps' or 'tokens'")
+    parser.add_argument('--max_training_tokens', type=int, help='Maximum effective non-pad tokens when stop_unit=tokens')
+    parser.add_argument('--eval_unit', type=str, choices=['steps', 'tokens'], help="Evaluation trigger unit: 'steps' or 'tokens'")
+    parser.add_argument('--eval_interval_tokens', type=int, help='Run eval every N effective tokens when eval_unit=tokens')
     parser.add_argument('--checkpoint_interval', type=int, help='Push checkpoint to hub every N optimizer steps')
-    parser.add_argument('--checkpoint_repo_pattern', type=str, help='Hub repo naming pattern with {i} or {step}, e.g. user/model-step-{i}')
+    parser.add_argument('--checkpoint_unit', type=str, choices=['steps', 'tokens'], help="Checkpoint trigger unit: 'steps' or 'tokens'")
+    parser.add_argument('--checkpoint_interval_tokens', type=int, help='Push checkpoint every N effective tokens when checkpoint_unit=tokens')
+    parser.add_argument('--checkpoint_repo_pattern', type=str, help='Hub repo naming pattern with {i}/{step} (optional {tokens}), e.g. user/model-step-{i}')
     parser.add_argument('--no_checkpoint_push', action='store_true', help='Disable hub checkpoint pushing')
     parser.add_argument('--no_lmms_eval', action='store_true', help='Disable lmms-eval during training')
     parser.add_argument('--relevance_min_rating', type=int, help='Minimum relevance rating of images per sample')
@@ -1425,8 +1546,20 @@ def main():
             train_cfg.train_split = args.train_split
         if args.val_split is not None:
             train_cfg.val_split = args.val_split
+        if args.stop_unit is not None:
+            train_cfg.stop_unit = args.stop_unit
+        if args.max_training_tokens is not None:
+            train_cfg.max_training_tokens = args.max_training_tokens
+        if args.eval_unit is not None:
+            train_cfg.eval_unit = args.eval_unit
+        if args.eval_interval_tokens is not None:
+            train_cfg.eval_interval_tokens = args.eval_interval_tokens
         if args.checkpoint_interval is not None:
             train_cfg.checkpoint_interval = args.checkpoint_interval
+        if args.checkpoint_unit is not None:
+            train_cfg.checkpoint_unit = args.checkpoint_unit
+        if args.checkpoint_interval_tokens is not None:
+            train_cfg.checkpoint_interval_tokens = args.checkpoint_interval_tokens
         if args.checkpoint_repo_pattern is not None:
             train_cfg.checkpoint_repo_pattern = args.checkpoint_repo_pattern
         if args.no_checkpoint_push:
@@ -1454,8 +1587,20 @@ def main():
         vlm_cfg.momh_enabled = args.momh_enabled
     if args.resume_from_vlm_checkpoint:
         train_cfg.resume_from_vlm_checkpoint = True
+    if args.stop_unit is not None:
+        train_cfg.stop_unit = args.stop_unit
+    if args.max_training_tokens is not None:
+        train_cfg.max_training_tokens = args.max_training_tokens
+    if args.eval_unit is not None:
+        train_cfg.eval_unit = args.eval_unit
+    if args.eval_interval_tokens is not None:
+        train_cfg.eval_interval_tokens = args.eval_interval_tokens
     if args.checkpoint_interval is not None:
         train_cfg.checkpoint_interval = args.checkpoint_interval
+    if args.checkpoint_unit is not None:
+        train_cfg.checkpoint_unit = args.checkpoint_unit
+    if args.checkpoint_interval_tokens is not None:
+        train_cfg.checkpoint_interval_tokens = args.checkpoint_interval_tokens
     if args.checkpoint_repo_pattern is not None:
         train_cfg.checkpoint_repo_pattern = args.checkpoint_repo_pattern
     if args.no_checkpoint_push:

@@ -73,10 +73,16 @@ class TrainConfig:
     gradient_accumulation_steps: int = 16
     max_grad_norm: float = 1.0
     eval_in_epochs: bool = True
+    stop_unit: str = "steps"  # steps | tokens
     eval_interval: int = 500
+    eval_unit: str = "steps"  # steps | tokens
+    eval_interval_tokens: int | None = None
     checkpoint_interval: int = 500
+    checkpoint_unit: str = "steps"  # steps | tokens
+    checkpoint_interval_tokens: int | None = None
     stats_log_interval: int = 100
     max_training_steps: int = 20_000
+    max_training_tokens: int | None = None
     max_images_per_example: int = 1
     max_images_per_knapsack: int = 18
     max_sample_length: int = 8192

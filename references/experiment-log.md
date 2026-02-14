@@ -344,3 +344,50 @@ Documentation updates:
 
 - Code: `train.py`
 - Docs: `README.md`, `references/troubleshooting.md`
+
+## 2026-02-14 — Hybrid Step/Token Scheduling for Stop, Eval, and Checkpoint
+
+**Type:** Configuration
+**General description:** Added explicit schedule units so training stop, evaluation cadence, and checkpoint cadence can be driven by either optimizer steps or consumed effective tokens.
+
+### Details
+
+Configuration/API updates:
+- Added fields in `TrainConfig`:
+  - `stop_unit: steps|tokens`
+  - `max_training_tokens`
+  - `eval_unit: steps|tokens`
+  - `eval_interval_tokens`
+  - `checkpoint_unit: steps|tokens`
+  - `checkpoint_interval_tokens`
+- Added equivalent CLI flags for non-config runs.
+
+Training-loop updates:
+- Added fail-fast schedule validation (`_validate_training_schedule_config`).
+- Replaced hardcoded step-modulo checks with hybrid trigger logic:
+  - step mode uses modulo intervals.
+  - token mode uses threshold crossing (`_advance_token_trigger`) to handle variable tokens/step.
+- Stop criterion now supports token budgets via `_should_stop_training`.
+- Checkpoint naming now accepts optional `{tokens}` placeholder in `checkpoint_repo_pattern`.
+
+Logging updates:
+- Added one-time schedule metadata logs:
+  - `schedule/stop_unit`
+  - `schedule/eval_unit`
+  - `schedule/checkpoint_unit`
+
+Documentation updates:
+- `README.md` includes step/token scheduling semantics and token-based YAML example.
+- `configs/train.example.yaml` includes new schedule fields and token-mode placeholders.
+
+### Key Points
+
+- Default behavior remains step-based and backward-compatible.
+- Token-based scheduling is now available for stop/eval/checkpoint without changing LR schedule behavior.
+- Token-trigger logic is threshold-based, avoiding missed events under variable-length batches.
+
+### Links
+
+- Code: `train.py`, `models/config.py`
+- Tests: `tests/test_training_schedule.py`
+- Config: `configs/train.example.yaml`

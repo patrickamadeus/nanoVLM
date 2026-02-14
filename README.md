@@ -109,6 +109,21 @@ python train.py --config configs/train.example.yaml
 ```
 `train.py --config` expects top-level keys `mode`, `vlm`, and `train`.
 When `--config` is set, only `--nanovlm` or `--dualtower` can override the config mode from CLI; other train overrides must be set in the YAML file.
+Training/eval/checkpoint cadence supports both step and token clocks:
+- Stop condition: `train.stop_unit: steps|tokens` with `max_training_steps` or `max_training_tokens`
+- Eval cadence: `train.eval_unit: steps|tokens` with `eval_interval` or `eval_interval_tokens`
+- Checkpoint cadence: `train.checkpoint_unit: steps|tokens` with `checkpoint_interval` or `checkpoint_interval_tokens`
+
+Example token-based schedule:
+```yaml
+train:
+  stop_unit: tokens
+  max_training_tokens: 250000000
+  eval_unit: tokens
+  eval_interval_tokens: 5000000
+  checkpoint_unit: tokens
+  checkpoint_interval_tokens: 10000000
+```
 To prefix generated W&B run names while keeping the default naming scheme, set `train.wandb_run_name_prefix` in your config (for example: `wandb_run_name_prefix: "debug"`).
 To set the W&B project from config, set `train.wandb_project` (for example: `wandb_project: "my-project"`).
 To enable Mixture of Modality Heads (MoMH) attention, set `vlm.momh_enabled: true` in config (disabled by default). You can tune head allocation with `vlm.momh_head_pct_vision` and `vlm.momh_head_pct_text`.

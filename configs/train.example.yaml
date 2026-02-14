@@ -13,8 +13,16 @@ train:
   lr_vision_backbone: 0.0
   batch_size: 4
   gradient_accumulation_steps: 16
-  max_training_steps: 20000
-  checkpoint_interval: 500
+  stop_unit: "steps"                # "steps" | "tokens"
+  max_training_steps: 20000         # set when stop_unit="steps"
+  max_training_tokens: null         # set when stop_unit="tokens"
+  eval_unit: "steps"                # "steps" | "tokens"
+  eval_in_epoch: false
+  eval_interval: 500                # set when eval_unit="steps"
+  eval_interval_tokens: null        # set when eval_unit="tokens"
+  checkpoint_unit: "steps"          # "steps" | "tokens"
+  checkpoint_interval: 500          # set when checkpoint_unit="steps"
+  checkpoint_interval_tokens: null  # set when checkpoint_unit="tokens"
   checkpoint_repo_pattern: "patrickamadeus/dt8k1img-ref-step-{i}"
   train_dataset_path: "patrickamadeus/the_cauldron"
   train_dataset_name:
