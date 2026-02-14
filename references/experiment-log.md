@@ -391,3 +391,152 @@ Documentation updates:
 - Code: `train.py`, `models/config.py`
 - Tests: `tests/test_training_schedule.py`
 - Config: `configs/train.example.yaml`
+
+## 2026-02-14 — Full-State Local Checkpointing + Explicit Continuation Path
+
+**Type:** Infrastructure
+**General description:** Added local full-state checkpoint save/load for training continuation while keeping `resume_from_vlm_checkpoint` as model-only initialization at step 0.
+
+### Details
+
+Config/API updates:
+- Added `train.continue_from_checkpoint` (local checkpoint directory path for full-state continuation).
+- Added `train.checkpoint_dir` and `train.keep_last_n_checkpoints`.
+- Kept `train.resume_from_vlm_checkpoint` semantics as model-only init (new run state).
+- Added CLI flags:
+  - `--continue_from_checkpoint`
+  - `--keep_last_n_checkpoints`
+
+Checkpoint behavior updates:
+- Checkpoint cadence (`checkpoint_unit` + intervals) now always writes a local full-state checkpoint.
+- Saved full-state payload includes:
+  - model (`config.json` + `model.safetensors`)
+  - optimizer state
+  - `global_step`, `global_consumed_tokens`, `epoch`
+  - token-trigger cursors (`next_eval_tokens`, `next_checkpoint_tokens`)
+  - RNG state (`python`, `numpy`, `torch`, `torch.cuda`)
+  - best-validation bookkeeping and schedule-unit snapshot
+- Added local retention pruning via `keep_last_n_checkpoints`.
+- Hub push remains optional (`push_checkpoints_to_hub`) and is no longer the only checkpoint artifact.
+
+Validation and guardrails:
+- Added mutual-exclusion validation for:
+  - `resume_from_vlm_checkpoint` + `continue_from_checkpoint`
+- Added `keep_last_n_checkpoints > 0` validation.
+- Added stream-dataset warning for continuation (`stream_dataset=true` is best-effort, not exact replay).
+
+### Validation Runs (GPU)
+
+Environment:
+- `CUDA_VISIBLE_DEVICES=1`
+- `HF_HOME=/home/yovakementchedjhieva/users/patrick/huggingface`
+
+Run 1 (checkpoint creation):
+- Config: `/tmp/train.ckpt.phase1.yaml` (derived from `configs/train.small_debug.momh.yaml`)
+- Key overrides: `max_training_steps=3`, `checkpoint_interval=1`, `checkpoint_dir=/tmp/nanovlm_ckpt_test`, `keep_last_n_checkpoints=2`, `log_wandb=false`
+- Result:
+  - Saved checkpoints at steps 1, 2, 3
+  - Retention pruning applied (kept latest 2)
+
+Run 2 (continuation):
+- Config: `/tmp/train.ckpt.phase2.yaml`
+- `continue_from_checkpoint=/tmp/nanovlm_ckpt_test/.../step-00000003-tokens-000000000798`
+- `max_training_steps=5`
+- Result:
+  - Restored state at `step=3`, `consumed_tokens=798`
+  - Continued through steps 4 and 5
+  - New checkpoints saved and retention pruning applied
+
+### Tests
+
+- `CUDA_VISIBLE_DEVICES=1 pytest -q tests/test_checkpointing.py tests/test_training_schedule.py tests/test_train_checkpoint_cfg.py`
+- Result: `10 passed`
+
+### Links
+
+- Code: `train.py`, `train_utils/checkpointing.py`, `models/config.py`
+- Tests: `tests/test_checkpointing.py`, `tests/test_training_schedule.py`
+- Docs/Config: `README.md`, `configs/train.example.yaml`, `references/troubleshooting.md`
+
+## 2026-02-14 — Deterministic Continuation Fix (Restore In-Epoch Dataloader Cursor)
+
+**Type:** Bugfix
+**General description:** Fixed continuation mismatch where resumed runs diverged from the original run despite restoring model/optimizer/RNG.
+
+### Root cause
+
+- Full-state checkpoints restored:
+  - model weights
+  - optimizer state
+  - global step/tokens
+  - RNG state
+- But did not restore in-epoch dataloader cursor.
+- With packed iterable data (`ConstantLengthDataset`) and shuffle, restarting the iterator at epoch boundary changed microbatch order after resume.
+
+### Implementation
+
+- Added `microbatches_seen_in_epoch` to saved checkpoint payload.
+- On resume:
+  - restore `epoch`, `global_step`, `global_consumed_tokens`, RNG, optimizer state.
+  - fast-forward the train iterator by `microbatches_seen_in_epoch` when entering the resumed epoch.
+- Removed checkpoint run-name override so replay runs keep explicit run prefixes/names.
+
+### Validation Runs (GPU)
+
+Environment:
+- `CUDA_VISIBLE_DEVICES=1`
+- `HF_HOME=/home/yovakementchedjhieva/users/patrick/huggingface`
+
+Project:
+- `patrickirawan-mbzuai/momh-resume-check`
+
+Runs:
+- Base run (0→40): `h83hz0vi`
+- Replay A (20→40): `p62u88oo`
+- Replay B (20→40): `99qaejjn`
+
+Result:
+- Replay A and Replay B now match the Base continuation exactly from step 21 onward.
+- Example aligned rows:
+  - Step 21: `train/step_loss=8.254981`, `train/batch_loss=8.657342`
+  - Step 22: `train/step_loss=8.941235`, `train/batch_loss=8.991491`
+  - Step 40: `train/step_loss=7.604202`, `train/batch_loss=7.835787`
+
+### Tests
+
+- `CUDA_VISIBLE_DEVICES=1 pytest -q tests/test_checkpointing.py tests/test_training_schedule.py tests/test_train_checkpoint_cfg.py`
+- Result: `10 passed`
+
+### Links
+
+- Code: `train.py`, `train_utils/checkpointing.py`
+- Tests: `tests/test_checkpointing.py`, `tests/test_training_schedule.py`, `tests/test_train_checkpoint_cfg.py`
+- Docs: `references/troubleshooting.md`
+
+## 2026-02-14 — Retrospective: Scheduling + Full-State Continuation Determinism
+
+**Type:** Retrospective
+**General description:** Consolidated learnings from effective-token metric cleanup, hybrid step/token scheduling, and full-state continuation bugfixes into reusable skills and troubleshooting guidance.
+
+### What worked
+
+- Effective-token definition simplified to non-pad tokens and reflected consistently in metrics/logging.
+- Hybrid `steps|tokens` schedule units for stop/eval/checkpoint improved control and observability.
+- Full-state continuation now replays deterministically for non-streaming runs after restoring in-epoch dataloader cursor.
+- Validation triad showed exact alignment across base and two independent replays:
+  - Base: `h83hz0vi`
+  - Replay A: `p62u88oo`
+  - Replay B: `99qaejjn`
+
+### What failed
+
+- Initial continuation implementation restored model/optimizer/RNG but not dataloader cursor, causing replay divergence after resume.
+- Continuation mode confusion occurred when model-only init and full-state continuation flags were both set.
+
+### Skill updates captured
+
+- Updated skill: `.codex/skills/nanovlm-checkpointing-determinism/SKILL.md`
+  - now includes cursor-restore invariant (`microbatches_seen_in_epoch`) and fast-forward requirement.
+- New skill: `.codex/skills/hybrid-step-token-scheduling-nanovlm/SKILL.md`
+  - documents step/token scheduling patterns, guardrails, and failure modes.
+- Skill index updated: `.codex/skills/registry.json`

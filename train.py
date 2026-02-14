@@ -13,6 +13,7 @@ import torch.optim as optim
 from statistics import mean
 from dataclasses import asdict
 from datetime import timedelta
+from pathlib import Path
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader
@@ -42,6 +43,13 @@ from train_utils.config_loader import (
     apply_dataclass_overrides,
     load_yaml_mapping,
     validate_allowed_keys,
+)
+from train_utils.checkpointing import (
+    load_full_checkpoint_state,
+    move_optimizer_state_to_device,
+    prune_old_checkpoints,
+    restore_rng_state,
+    save_full_checkpoint,
 )
 from train_utils.env import load_project_dotenv
 
@@ -420,12 +428,44 @@ def _validate_training_schedule_config(train_cfg):
     else:
         if train_cfg.checkpoint_interval_tokens is None or train_cfg.checkpoint_interval_tokens <= 0:
             raise ValueError("checkpoint_interval_tokens must be > 0 when checkpoint_unit='tokens'.")
+    if train_cfg.keep_last_n_checkpoints <= 0:
+        raise ValueError("keep_last_n_checkpoints must be > 0.")
+    if train_cfg.continue_from_checkpoint is not None and train_cfg.resume_from_vlm_checkpoint:
+        raise ValueError(
+            "resume_from_vlm_checkpoint and continue_from_checkpoint are mutually exclusive. "
+            "Use resume_from_vlm_checkpoint for model-only init or continue_from_checkpoint for full-state continuation."
+        )
 
     return {
         "stop_unit": stop_unit,
         "eval_unit": eval_unit,
         "checkpoint_unit": checkpoint_unit,
     }
+
+
+def _resolve_checkpoint_directory(path_value: str) -> str:
+    path = Path(path_value).expanduser().resolve()
+    if path.exists() and not path.is_dir():
+        raise ValueError(f"checkpoint_dir must be a directory path, got file: {path}")
+    path.mkdir(parents=True, exist_ok=True)
+    return str(path)
+
+
+def _fast_forward_train_iterator(iter_train_loader, train_loader, batches_to_skip: int):
+    if batches_to_skip < 0:
+        raise ValueError(f"batches_to_skip must be >= 0, got {batches_to_skip}.")
+    if batches_to_skip == 0:
+        return iter_train_loader
+
+    skipped = 0
+    while skipped < batches_to_skip:
+        try:
+            next(iter_train_loader)
+        except StopIteration:
+            iter_train_loader = iter(train_loader)
+            continue
+        skipped += 1
+    return iter_train_loader
 
 
 def _advance_token_trigger(global_tokens: int, next_trigger_tokens: int | None, interval_tokens: int | None):
@@ -589,6 +629,7 @@ def _maybe_mark_batch_dynamic(*, input_ids: torch.Tensor, labels: torch.Tensor, 
 
 def train(train_cfg, vlm_cfg, model_mode: str = "nanovlm"):
     schedule_units = _validate_training_schedule_config(train_cfg)
+    train_cfg.checkpoint_dir = _resolve_checkpoint_directory(train_cfg.checkpoint_dir)
     try:
         train_cfg.checkpoint_repo_pattern.format(step=1, i=1, tokens=1)
     except Exception as e:
@@ -597,7 +638,7 @@ def train(train_cfg, vlm_cfg, model_mode: str = "nanovlm"):
         ) from e
     if train_cfg.use_lmms_eval:
         raise ValueError(
-            "use_lmms_eval=True is not supported in this hub-only checkpoint workflow."
+            "use_lmms_eval=True is not supported in the current training checkpoint workflow."
         )
     vlm_cfg.activation_checkpointing_mode = normalize_activation_checkpointing_mode(
         getattr(vlm_cfg, "activation_checkpointing_mode", "regular")
@@ -611,6 +652,18 @@ def train(train_cfg, vlm_cfg, model_mode: str = "nanovlm"):
             "Selective activation checkpointing requires `train.compile=True`. "
             "Set `vlm.activation_checkpointing_mode: regular` or enable compile."
         )
+
+    continue_state = None
+    if train_cfg.continue_from_checkpoint is not None:
+        checkpoint_path = Path(train_cfg.continue_from_checkpoint).expanduser().resolve()
+        log_info(f"Loading full-state checkpoint metadata: {ctext(str(checkpoint_path), 'cyan', attrs=('bold',))}")
+        continue_state = load_full_checkpoint_state(str(checkpoint_path), map_location="cpu")
+        if train_cfg.stream_dataset:
+            log_warn(
+                "continue_from_checkpoint is set with stream_dataset=true. "
+                "Resume is best-effort and exact replay is not guaranteed for streaming datasets."
+            )
+        restore_rng_state(continue_state["rng_state"])
 
     train_loader, val_loader, iter_train_loader, iter_val_loader = get_dataloaders(train_cfg, vlm_cfg)
 
@@ -638,6 +691,8 @@ def train(train_cfg, vlm_cfg, model_mode: str = "nanovlm"):
         run.define_metric("train/*", step_metric="train/consumed_tokens")
         run.define_metric("training_stats/*", step_metric="train/consumed_tokens")
         run.define_metric("val_loss", step_metric="train/consumed_tokens")
+        run.define_metric("checkpoint/continued", step_metric="train/consumed_tokens")
+        run.define_metric("checkpoint/local_saved", step_metric="train/consumed_tokens")
         run.define_metric("checkpoint/pushed", step_metric="train/consumed_tokens")
         run.define_metric("grad_norm", step_metric="train/consumed_tokens")
         run.log(
@@ -651,7 +706,19 @@ def train(train_cfg, vlm_cfg, model_mode: str = "nanovlm"):
         )
 
     # Initialize model
-    if train_cfg.resume_from_vlm_checkpoint:
+    if continue_state is not None:
+        checkpoint_path = Path(train_cfg.continue_from_checkpoint).expanduser().resolve()
+        log_info(f"Continuing from full-state checkpoint: {ctext(str(checkpoint_path), 'cyan', attrs=('bold',))}")
+        if model_mode == "dualtower":
+            model = DualTowerVLM.from_pretrained(
+                str(checkpoint_path),
+                load_backbone=False,
+            )
+        else:
+            model = VisionLanguageModel.from_pretrained(str(checkpoint_path))
+        if hasattr(model, "cfg"):
+            vlm_cfg = model.cfg
+    elif train_cfg.resume_from_vlm_checkpoint:
         log_info(f"Loading VLM checkpoint: {ctext(vlm_cfg.vlm_checkpoint_path, 'cyan', attrs=('bold',))}")
         vlm_model = VisionLanguageModel.from_pretrained(vlm_cfg.vlm_checkpoint_path)
         vlm_cfg = _apply_checkpoint_cfg_overrides(getattr(vlm_model, "cfg", None), vlm_cfg)
@@ -830,6 +897,16 @@ def train(train_cfg, vlm_cfg, model_mode: str = "nanovlm"):
         model = wrap_model(model)
         log_success("Model wrapped for DDP")
 
+    if continue_state is not None:
+        loaded_schedule_units = continue_state["schedule_units"]
+        if loaded_schedule_units != schedule_units:
+            raise ValueError(
+                "continue_from_checkpoint schedule units mismatch. "
+                f"Checkpoint has {loaded_schedule_units}, current config has {schedule_units}."
+            )
+        optimizer.load_state_dict(continue_state["optimizer_state_dict"])
+        move_optimizer_state_to_device(optimizer, device)
+
     epoch_times = []
     best_val_loss = float('inf')
     best_val_step = None
@@ -838,12 +915,52 @@ def train(train_cfg, vlm_cfg, model_mode: str = "nanovlm"):
     global_step = 0
     global_consumed_tokens = 0
     epoch = 0
+    resume_target_epoch = None
+    resume_microbatches_seen_in_epoch = 0
+    resume_fast_forward_done = False
     next_eval_tokens = train_cfg.eval_interval_tokens if schedule_units["eval_unit"] == "tokens" else None
     next_checkpoint_tokens = (
         train_cfg.checkpoint_interval_tokens
         if schedule_units["checkpoint_unit"] == "tokens"
         else None
     )
+    if continue_state is not None:
+        global_step = int(continue_state["step"])
+        global_consumed_tokens = int(continue_state["consumed_tokens"])
+        resume_target_epoch = int(continue_state["epoch"])
+        epoch = resume_target_epoch - 1
+        resume_microbatches_seen_in_epoch = int(continue_state.get("microbatches_seen_in_epoch", 0))
+        best_val_loss = float(continue_state.get("best_val_loss", float("inf")))
+        best_val_step = continue_state.get("best_val_step")
+        best_checkpoint_repo_id = continue_state.get("best_checkpoint_repo_id")
+        next_eval_tokens = continue_state.get("next_eval_tokens")
+        next_checkpoint_tokens = continue_state.get("next_checkpoint_tokens")
+        if schedule_units["eval_unit"] == "tokens" and next_eval_tokens is None:
+            interval = train_cfg.eval_interval_tokens
+            next_eval_tokens = ((global_consumed_tokens // interval) + 1) * interval
+        if schedule_units["checkpoint_unit"] == "tokens" and next_checkpoint_tokens is None:
+            interval = train_cfg.checkpoint_interval_tokens
+            next_checkpoint_tokens = ((global_consumed_tokens // interval) + 1) * interval
+        if is_master():
+            log_success(
+                "Restored full-state checkpoint at "
+                f"step={ctext(global_step, 'cyan', attrs=('bold',))}, "
+                f"consumed_tokens={ctext(f'{global_consumed_tokens:,}', 'cyan', attrs=('bold',))}"
+            )
+            if resume_microbatches_seen_in_epoch > 0:
+                log_info(
+                    "Resuming with dataloader cursor fast-forward at "
+                    f"epoch={ctext(resume_target_epoch, 'cyan', attrs=('bold',))}, "
+                    f"microbatches_seen_in_epoch={ctext(resume_microbatches_seen_in_epoch, 'cyan', attrs=('bold',))}"
+                )
+            if train_cfg.log_wandb:
+                run.log(
+                    {
+                        "checkpoint/continued": 1,
+                        "train/consumed_tokens": global_consumed_tokens,
+                    },
+                    step=global_step,
+                )
     
     # Training stats accumulators
     accumulated_stats = {
@@ -869,10 +986,29 @@ def train(train_cfg, vlm_cfg, model_mode: str = "nanovlm"):
         accumulated_loss_tokens = torch.zeros((), device=device, dtype=torch.float32)
         accumulated_effective_tokens_for_update_local = 0
         accumulated_token_capacity_for_update_local = 0
+        microbatches_seen_in_epoch = 0
         data_load_start = time.time()
         stop_training = False
 
         log_info(f"Starting training loop for epoch {ctext(epoch, 'cyan', attrs=('bold',))}")
+        if (
+            continue_state is not None
+            and not resume_fast_forward_done
+            and resume_target_epoch is not None
+            and epoch == resume_target_epoch
+            and resume_microbatches_seen_in_epoch > 0
+        ):
+            iter_train_loader = _fast_forward_train_iterator(
+                iter_train_loader,
+                train_loader,
+                resume_microbatches_seen_in_epoch,
+            )
+            microbatches_seen_in_epoch = resume_microbatches_seen_in_epoch
+            resume_fast_forward_done = True
+            log_info(
+                "Applied dataloader cursor fast-forward for resumed epoch: "
+                f"skipped {ctext(resume_microbatches_seen_in_epoch, 'cyan', attrs=('bold',))} microbatches."
+            )
         remaining_steps = None
         if schedule_units["stop_unit"] == "steps":
             remaining_steps = max(train_cfg.max_training_steps - global_step, 0)
@@ -884,6 +1020,7 @@ def train(train_cfg, vlm_cfg, model_mode: str = "nanovlm"):
             leave=False,
         )
         for i, batch in enumerate(synchronized_dataloader_step(iter_train_loader, is_dist())):
+            microbatches_seen_in_epoch += 1
             is_update_step = (i + 1) % train_cfg.gradient_accumulation_steps == 0
             step_after_update = global_step + 1 if is_update_step else global_step
             grad_norm_value = None
@@ -1144,18 +1281,58 @@ def train(train_cfg, vlm_cfg, model_mode: str = "nanovlm"):
 
                 model.train()
 
-            should_push_checkpoint = False
-            if is_update_step and train_cfg.push_checkpoints_to_hub and is_master():
+            should_checkpoint = False
+            if is_update_step:
                 if schedule_units["checkpoint_unit"] == "steps":
-                    should_push_checkpoint = (step_after_update % train_cfg.checkpoint_interval == 0)
+                    should_checkpoint = (step_after_update % train_cfg.checkpoint_interval == 0)
                 else:
-                    should_push_checkpoint, next_checkpoint_tokens = _advance_token_trigger(
+                    should_checkpoint, next_checkpoint_tokens = _advance_token_trigger(
                         global_consumed_tokens,
                         next_checkpoint_tokens,
                         train_cfg.checkpoint_interval_tokens,
                     )
 
-            if should_push_checkpoint:
+            if should_checkpoint and is_master():
+                save_model = model.module if is_dist() else model
+                checkpoint_path = save_full_checkpoint(
+                    model=save_model,
+                    optimizer=optimizer,
+                    checkpoint_root=train_cfg.checkpoint_dir,
+                    run_name=run_name,
+                    step=step_after_update,
+                    consumed_tokens=global_consumed_tokens,
+                    epoch=epoch,
+                    microbatches_seen_in_epoch=microbatches_seen_in_epoch,
+                    next_eval_tokens=next_eval_tokens,
+                    next_checkpoint_tokens=next_checkpoint_tokens,
+                    best_val_loss=best_val_loss,
+                    best_val_step=best_val_step,
+                    best_checkpoint_repo_id=best_checkpoint_repo_id,
+                    schedule_units=schedule_units,
+                    train_cfg=train_cfg,
+                    vlm_cfg=vlm_cfg,
+                )
+                removed_checkpoints = prune_old_checkpoints(
+                    checkpoint_root=train_cfg.checkpoint_dir,
+                    run_name=run_name,
+                    keep_last_n=train_cfg.keep_last_n_checkpoints,
+                )
+                log_info(
+                    f"Saved full-state checkpoint at {_progress_text(step_after_update, global_consumed_tokens, train_cfg, schedule_units)} "
+                    f"to {ctext(checkpoint_path, 'cyan')}"
+                )
+                if removed_checkpoints:
+                    log_info(f"Pruned {len(removed_checkpoints)} old local checkpoints.")
+                if train_cfg.log_wandb:
+                    run.log(
+                        {
+                            "checkpoint/local_saved": 1,
+                            "train/consumed_tokens": global_consumed_tokens,
+                        },
+                        step=step_after_update,
+                    )
+
+            if should_checkpoint and train_cfg.push_checkpoints_to_hub and is_master():
                 checkpoint_repo_id = train_cfg.checkpoint_repo_pattern.format(
                     step=step_after_update,
                     i=step_after_update,
@@ -1410,6 +1587,7 @@ def main():
             "--compile",
             "--log_wandb",
             "--resume_from_vlm_checkpoint",
+            "--continue_from_checkpoint",
             "--no_log_wandb",
             "--train_dataset_path",
             "--train_dataset_name",
@@ -1422,6 +1600,7 @@ def main():
             "--checkpoint_interval",
             "--checkpoint_unit",
             "--checkpoint_interval_tokens",
+            "--keep_last_n_checkpoints",
             "--checkpoint_repo_pattern",
             "--no_checkpoint_push",
             "--no_lmms_eval",
@@ -1461,7 +1640,8 @@ def main():
     parser.add_argument('--momh_enabled', type=bool, help='Enable MoMH attention')
     parser.add_argument('--compile', type=bool, help='Use torch.compile to optimize the model')
     parser.add_argument('--log_wandb', type=bool, help='Log to wandb')
-    parser.add_argument('--resume_from_vlm_checkpoint', type=bool, default=False, help='Resume training from VLM checkpoint specified by vlm_checkpoint_path (or default if not provided)')
+    parser.add_argument('--resume_from_vlm_checkpoint', type=bool, default=False, help='Start a fresh run from model-only VLM checkpoint weights specified by vlm_checkpoint_path.')
+    parser.add_argument('--continue_from_checkpoint', type=str, help='Continue training from a local full-state checkpoint directory.')
     parser.add_argument('--no_log_wandb', action='store_true', help='Do not log to wandb')
     parser.add_argument('--train_dataset_path', type=str, help='Train dataset path')
     parser.add_argument('--train_dataset_name', nargs='+', type=str, help='Dataset config names to load (use "default" for single-config datasets)')
@@ -1471,9 +1651,10 @@ def main():
     parser.add_argument('--max_training_tokens', type=int, help='Maximum effective non-pad tokens when stop_unit=tokens')
     parser.add_argument('--eval_unit', type=str, choices=['steps', 'tokens'], help="Evaluation trigger unit: 'steps' or 'tokens'")
     parser.add_argument('--eval_interval_tokens', type=int, help='Run eval every N effective tokens when eval_unit=tokens')
-    parser.add_argument('--checkpoint_interval', type=int, help='Push checkpoint to hub every N optimizer steps')
+    parser.add_argument('--checkpoint_interval', type=int, help='Save a local full-state checkpoint every N optimizer steps')
     parser.add_argument('--checkpoint_unit', type=str, choices=['steps', 'tokens'], help="Checkpoint trigger unit: 'steps' or 'tokens'")
-    parser.add_argument('--checkpoint_interval_tokens', type=int, help='Push checkpoint every N effective tokens when checkpoint_unit=tokens')
+    parser.add_argument('--checkpoint_interval_tokens', type=int, help='Save a local full-state checkpoint every N effective tokens when checkpoint_unit=tokens')
+    parser.add_argument('--keep_last_n_checkpoints', type=int, help='Keep only the latest N local full-state checkpoints')
     parser.add_argument('--checkpoint_repo_pattern', type=str, help='Hub repo naming pattern with {i}/{step} (optional {tokens}), e.g. user/model-step-{i}')
     parser.add_argument('--no_checkpoint_push', action='store_true', help='Disable hub checkpoint pushing')
     parser.add_argument('--no_lmms_eval', action='store_true', help='Disable lmms-eval during training')
@@ -1536,6 +1717,8 @@ def main():
             train_cfg.compile = args.compile
         if args.log_wandb is not None:
             train_cfg.log_wandb = args.log_wandb
+        if args.continue_from_checkpoint is not None:
+            train_cfg.continue_from_checkpoint = args.continue_from_checkpoint
         if args.no_log_wandb is True:
             train_cfg.log_wandb = False
         if args.train_dataset_path is not None:
@@ -1560,6 +1743,8 @@ def main():
             train_cfg.checkpoint_unit = args.checkpoint_unit
         if args.checkpoint_interval_tokens is not None:
             train_cfg.checkpoint_interval_tokens = args.checkpoint_interval_tokens
+        if args.keep_last_n_checkpoints is not None:
+            train_cfg.keep_last_n_checkpoints = args.keep_last_n_checkpoints
         if args.checkpoint_repo_pattern is not None:
             train_cfg.checkpoint_repo_pattern = args.checkpoint_repo_pattern
         if args.no_checkpoint_push:
@@ -1587,6 +1772,8 @@ def main():
         vlm_cfg.momh_enabled = args.momh_enabled
     if args.resume_from_vlm_checkpoint:
         train_cfg.resume_from_vlm_checkpoint = True
+    if args.continue_from_checkpoint is not None:
+        train_cfg.continue_from_checkpoint = args.continue_from_checkpoint
     if args.stop_unit is not None:
         train_cfg.stop_unit = args.stop_unit
     if args.max_training_tokens is not None:
@@ -1601,6 +1788,8 @@ def main():
         train_cfg.checkpoint_unit = args.checkpoint_unit
     if args.checkpoint_interval_tokens is not None:
         train_cfg.checkpoint_interval_tokens = args.checkpoint_interval_tokens
+    if args.keep_last_n_checkpoints is not None:
+        train_cfg.keep_last_n_checkpoints = args.keep_last_n_checkpoints
     if args.checkpoint_repo_pattern is not None:
         train_cfg.checkpoint_repo_pattern = args.checkpoint_repo_pattern
     if args.no_checkpoint_push:
@@ -1616,8 +1805,14 @@ def main():
     if args.nanovlm:
         model_mode = "nanovlm"
 
+    if train_cfg.resume_from_vlm_checkpoint and train_cfg.continue_from_checkpoint is not None:
+        parser.error(
+            "resume_from_vlm_checkpoint and continue_from_checkpoint are mutually exclusive. "
+            "Use resume_from_vlm_checkpoint for model-only init or continue_from_checkpoint for full-state continuation."
+        )
+
     if train_cfg.resume_from_vlm_checkpoint and vlm_cfg.vlm_checkpoint_path is not None:
-        # When resuming a full VLM, we don't need to load individual backbone weights from original sources.
+        # Model-only initialization from a full VLM does not need backbone source loading.
         vlm_cfg.vlm_load_backbone_weights = False
 
     if "RANK" in os.environ and "WORLD_SIZE" in os.environ:

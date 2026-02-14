@@ -80,6 +80,8 @@ class TrainConfig:
     checkpoint_interval: int = 500
     checkpoint_unit: str = "steps"  # steps | tokens
     checkpoint_interval_tokens: int | None = None
+    checkpoint_dir: str = "checkpoints"
+    keep_last_n_checkpoints: int = 3
     stats_log_interval: int = 100
     max_training_steps: int = 20_000
     max_training_tokens: int | None = None
@@ -88,7 +90,8 @@ class TrainConfig:
     max_sample_length: int = 8192
     use_packing: bool = True
     compile: bool = False
-    resume_from_vlm_checkpoint: bool = True # Continue training from a full VLM checkpoint.
+    resume_from_vlm_checkpoint: bool = True # Start a new run from model-only VLM checkpoint weights.
+    continue_from_checkpoint: str | None = None  # Continue training from a local full-state checkpoint directory.
     train_dataset_path: str = 'patrickamadeus/the_cauldron'
     train_dataset_name: tuple[str, ...] = ("all", ) #('allava_laion', 'allava_vflan', 'cambrian(filtered)_processed', 'LLaVA_Instruct_150K', 'mmevol', 'sharegpt4o', 'sharegpt4v(coco)', 'sharegpt4v(knowledge)', 'sharegpt4v(llava)', 'sharegpt4v(sam)') # 'vision_flan(filtered)', 'lvis_instruct4v',
     train_split: str = "train"

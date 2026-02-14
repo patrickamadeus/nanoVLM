@@ -46,3 +46,18 @@ def test_advance_token_trigger_handles_threshold_crossing_and_catchup():
     triggered, next_threshold = _advance_token_trigger(global_tokens=3100, next_trigger_tokens=2000, interval_tokens=1000)
     assert triggered is True
     assert next_threshold == 4000
+
+
+def test_validate_training_schedule_rejects_non_positive_checkpoint_retention():
+    cfg = TrainConfig(keep_last_n_checkpoints=0)
+    with pytest.raises(ValueError, match="keep_last_n_checkpoints must be > 0"):
+        _validate_training_schedule_config(cfg)
+
+
+def test_validate_training_schedule_rejects_mixed_init_and_continue_modes():
+    cfg = TrainConfig(
+        resume_from_vlm_checkpoint=True,
+        continue_from_checkpoint="checkpoints/step-00000010-tokens-000000001024",
+    )
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        _validate_training_schedule_config(cfg)

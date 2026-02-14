@@ -112,7 +112,7 @@ When `--config` is set, only `--nanovlm` or `--dualtower` can override the confi
 Training/eval/checkpoint cadence supports both step and token clocks:
 - Stop condition: `train.stop_unit: steps|tokens` with `max_training_steps` or `max_training_tokens`
 - Eval cadence: `train.eval_unit: steps|tokens` with `eval_interval` or `eval_interval_tokens`
-- Checkpoint cadence: `train.checkpoint_unit: steps|tokens` with `checkpoint_interval` or `checkpoint_interval_tokens`
+- Checkpoint cadence: `train.checkpoint_unit: steps|tokens` with `checkpoint_interval` or `checkpoint_interval_tokens` (always writes local full-state checkpoints)
 
 Example token-based schedule:
 ```yaml
@@ -123,7 +123,16 @@ train:
   eval_interval_tokens: 5000000
   checkpoint_unit: tokens
   checkpoint_interval_tokens: 10000000
+  checkpoint_dir: checkpoints
+  keep_last_n_checkpoints: 3
 ```
+Checkpoint semantics are explicit:
+- `train.resume_from_vlm_checkpoint: true` initializes model weights from `vlm.vlm_checkpoint_path` and starts a new run at step 0 (model-only init).
+- `train.continue_from_checkpoint: <local-checkpoint-dir>` restores full training state (model + optimizer + counters + RNG) and continues seamlessly.
+- These two modes are mutually exclusive.
+- Continuation restores the in-epoch dataloader cursor (`microbatches_seen_in_epoch`) for deterministic replay on non-streaming datasets.
+- With `train.stream_dataset: true`, continuation is best-effort and exact replay is not guaranteed.
+
 To prefix generated W&B run names while keeping the default naming scheme, set `train.wandb_run_name_prefix` in your config (for example: `wandb_run_name_prefix: "debug"`).
 To set the W&B project from config, set `train.wandb_project` (for example: `wandb_project: "my-project"`).
 To enable Mixture of Modality Heads (MoMH) attention, set `vlm.momh_enabled: true` in config (disabled by default). You can tune head allocation with `vlm.momh_head_pct_vision` and `vlm.momh_head_pct_text`.
@@ -161,7 +170,7 @@ To explicitly enable packing:
 ```bash
 python train.py --packing
 ```
-When resuming DualTower from `--vlm_checkpoint_path`, training initializes the right tower from `lm_model_type` (fresh HF LM init) and does not copy vanilla `decoder.*` checkpoint weights into the right tower.
+When initializing DualTower from `--vlm_checkpoint_path` (`resume_from_vlm_checkpoint=true`), training initializes the right tower from `lm_model_type` (fresh HF LM init) and does not copy vanilla `decoder.*` checkpoint weights into the right tower.
 `DualTowerVLM.from_pretrained(...)` now performs strict dualtower checkpoint loading (`model.safetensors` + `config.json`) without automatic key remapping from vanilla nanoVLM checkpoints. For vanilla-to-dualtower initialization, use `--resume_from_vlm_checkpoint` in training.
 DualTower left-tower prefill uses a visual-only attention mask derived from `vlm_extra_tokens`; right tower consumes the full sequence and receives left-tower K/V on visual positions during dual prefill.
 You can choose the left-tower masking policy with:

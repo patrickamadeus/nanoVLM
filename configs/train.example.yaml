@@ -21,9 +21,12 @@ train:
   eval_interval: 500                # set when eval_unit="steps"
   eval_interval_tokens: null        # set when eval_unit="tokens"
   checkpoint_unit: "steps"          # "steps" | "tokens"
-  checkpoint_interval: 500          # set when checkpoint_unit="steps"
-  checkpoint_interval_tokens: null  # set when checkpoint_unit="tokens"
+  checkpoint_interval: 500          # set when checkpoint_unit="steps" (local full-state checkpoints)
+  checkpoint_interval_tokens: null  # set when checkpoint_unit="tokens" (local full-state checkpoints)
+  checkpoint_dir: "checkpoints"
+  keep_last_n_checkpoints: 3
   checkpoint_repo_pattern: "patrickamadeus/dt8k1img-ref-step-{i}"
+  continue_from_checkpoint: null    # full-state continuation path (mutually exclusive with resume_from_vlm_checkpoint)
   train_dataset_path: "patrickamadeus/the_cauldron"
   train_dataset_name:
     - default
@@ -32,6 +35,7 @@ train:
   use_packing: true
   stream_dataset: true
   compile: false
+  resume_from_vlm_checkpoint: true  # model-only init at step 0
   wandb_project: "dualtower"
   wandb_run_name_prefix: "debug"
   log_wandb: true
