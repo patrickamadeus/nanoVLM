@@ -111,6 +111,14 @@ def dist_mean_scalar(x: float | int) -> float:
     t /= dist.get_world_size()
     return t.item()
 
+def dist_sum_scalar(x: float | int) -> float:
+    if not (dist.is_available() and dist.is_initialized()):
+        return float(x)
+
+    t = torch.tensor(x, device=torch.cuda.current_device(), dtype=torch.float64)
+    dist.all_reduce(t, op=dist.ReduceOp.SUM)
+    return t.item()
+
 def wrap_model(model):
     local_rank = int(os.environ["LOCAL_RANK"])
     return DistributedDataParallel(model, device_ids=[local_rank], output_device=local_rank,find_unused_parameters=True)
@@ -351,6 +359,24 @@ def get_lr(it, max_lr, max_steps):
     assert 0 <= decay_ratio <= 1
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff starts at 1 and goes to 0
     return min_lr + coeff * (max_lr - min_lr)
+
+
+def compute_batch_effective_token_metrics(attention_mask: torch.Tensor) -> tuple[int, int, float]:
+    """Return non-pad token count, token capacity, and non-pad ratio for a batch."""
+    token_capacity = int(attention_mask.numel())
+    if token_capacity <= 0:
+        raise ValueError("Token capacity must be > 0 when computing effective token metrics.")
+    effective_tokens = int(attention_mask.sum().item())
+    effective_ratio = effective_tokens / token_capacity
+    return effective_tokens, token_capacity, effective_ratio
+
+
+def compute_effective_token_ratio(effective_tokens: float, token_capacity: float) -> float:
+    """Return effective-token ratio with explicit denominator validation."""
+    token_capacity_value = float(token_capacity)
+    if token_capacity_value <= 0:
+        raise ValueError("Token capacity must be > 0 when computing effective token ratio.")
+    return float(effective_tokens) / token_capacity_value
 
 
 def _base_model(model):
@@ -738,7 +764,7 @@ def train(train_cfg, vlm_cfg, model_mode: str = "nanovlm"):
         'fw_bw_time': [],
         'post_process_time': [],
         'images_per_sample': [],
-        'effective_token_ratio_per_instance': [],
+        'effective_token_ratio': [],
     }
     
     while global_step < train_cfg.max_training_steps:
@@ -751,9 +777,8 @@ def train(train_cfg, vlm_cfg, model_mode: str = "nanovlm"):
         optimizer.zero_grad()
         accumulated_loss_sum = torch.zeros((), device=device, dtype=torch.float32)
         accumulated_loss_tokens = torch.zeros((), device=device, dtype=torch.float32)
-        accumulated_effective_ratio_sum = torch.zeros((), device=device, dtype=torch.float32)
-        accumulated_effective_ratio_count = torch.zeros((), device=device, dtype=torch.float32)
-        accumulated_tokens_for_update_local = 0
+        accumulated_effective_tokens_for_update_local = 0
+        accumulated_token_capacity_for_update_local = 0
         data_load_start = time.time()
 
         log_info(f"Starting training loop for epoch {ctext(epoch, 'cyan', attrs=('bold',))}")
@@ -771,6 +796,8 @@ def train(train_cfg, vlm_cfg, model_mode: str = "nanovlm"):
             grad_norm_value = None
             update_loss_value = None
             step_effective_token_ratio_value = None
+            step_effective_tokens_value = None
+            step_token_capacity_value = None
             batch_start_time = time.time()
             images = batch["images"]
             input_ids = batch["input_ids"].to(device)
@@ -815,13 +842,14 @@ def train(train_cfg, vlm_cfg, model_mode: str = "nanovlm"):
                         raise ValueError("Found a batch with no valid target tokens; check label masking.")
                     accumulated_loss_sum += loss.detach().to(dtype=torch.float32)
                     accumulated_loss_tokens += loss_token_count.to(dtype=torch.float32)
-                    valid_tokens_per_sample = (labels != -100).sum(dim=1).to(dtype=torch.float32)
-                    attention_tokens_per_sample = attention_mask.sum(dim=1).to(dtype=torch.float32).clamp_min(1.0)
-                    effective_token_ratio_per_sample = valid_tokens_per_sample / attention_tokens_per_sample
-                    accumulated_effective_ratio_sum += effective_token_ratio_per_sample.sum()
-                    accumulated_effective_ratio_count += float(effective_token_ratio_per_sample.numel())
 
             loss.backward()
+
+            batch_effective_tokens, batch_token_capacity, batch_effective_token_ratio = compute_batch_effective_token_metrics(
+                attention_mask
+            )
+            accumulated_effective_tokens_for_update_local += batch_effective_tokens
+            accumulated_token_capacity_for_update_local += batch_token_capacity
 
             fw_bw_time = time.time() - fw_bw_start
             post_process_start = time.time()
@@ -837,15 +865,28 @@ def train(train_cfg, vlm_cfg, model_mode: str = "nanovlm"):
                     raise ValueError("Gradient accumulation produced zero total target tokens; check label masking.")
 
                 update_loss_value = (total_loss_sum / total_loss_tokens).item()
-                total_effective_ratio_sum = accumulated_effective_ratio_sum.clone()
-                total_effective_ratio_count = accumulated_effective_ratio_count.clone()
                 if is_dist():
-                    dist.all_reduce(total_effective_ratio_sum, op=dist.ReduceOp.SUM)
-                    dist.all_reduce(total_effective_ratio_count, op=dist.ReduceOp.SUM)
-                total_effective_ratio_count_value = total_effective_ratio_count.item()
-                if total_effective_ratio_count_value <= 0:
-                    raise ValueError("Gradient accumulation produced zero instances; cannot compute effective token ratio.")
-                step_effective_token_ratio_value = (total_effective_ratio_sum / total_effective_ratio_count).item()
+                    update_effective_tokens = torch.tensor(
+                        float(accumulated_effective_tokens_for_update_local),
+                        device=device,
+                        dtype=torch.float64,
+                    )
+                    update_token_capacity = torch.tensor(
+                        float(accumulated_token_capacity_for_update_local),
+                        device=device,
+                        dtype=torch.float64,
+                    )
+                    dist.all_reduce(update_effective_tokens, op=dist.ReduceOp.SUM)
+                    dist.all_reduce(update_token_capacity, op=dist.ReduceOp.SUM)
+                    step_effective_tokens_value = int(update_effective_tokens.item())
+                    step_token_capacity_value = int(update_token_capacity.item())
+                else:
+                    step_effective_tokens_value = int(accumulated_effective_tokens_for_update_local)
+                    step_token_capacity_value = int(accumulated_token_capacity_for_update_local)
+                step_effective_token_ratio_value = compute_effective_token_ratio(
+                    step_effective_tokens_value,
+                    step_token_capacity_value,
+                )
                 grad_scale = get_world_size() / total_loss_tokens_value
                 for param in all_params:
                     if param.grad is not None:
@@ -886,17 +927,15 @@ def train(train_cfg, vlm_cfg, model_mode: str = "nanovlm"):
                 optimizer.zero_grad()
                 accumulated_loss_sum.zero_()
                 accumulated_loss_tokens.zero_()
-                accumulated_effective_ratio_sum.zero_()
-                accumulated_effective_ratio_count.zero_()
+                accumulated_effective_tokens_for_update_local = 0
+                accumulated_token_capacity_for_update_local = 0
 
             batch_loss = loss.item() / loss_token_count_value
-            batch_effective_token_ratio = effective_token_ratio_per_sample.mean().item()
             total_train_loss_sum += float(loss.item())
             total_train_loss_tokens += loss_token_count_value
 
-            num_tokens = torch.sum(attention_mask).item() # Sum of attention mask gives number of tokens
+            num_tokens = batch_effective_tokens
             total_tokens_processed += num_tokens
-            accumulated_tokens_for_update_local += num_tokens
             post_process_time = time.time() - post_process_start
 
             images_per_sample = [len(image_pack) for image_pack in images]
@@ -911,21 +950,12 @@ def train(train_cfg, vlm_cfg, model_mode: str = "nanovlm"):
             accumulated_stats['fw_bw_time'].append(fw_bw_time)
             accumulated_stats['post_process_time'].append(post_process_time)
             accumulated_stats['images_per_sample'].extend(images_per_sample)
-            accumulated_stats['effective_token_ratio_per_instance'].append(batch_effective_token_ratio)
+            accumulated_stats['effective_token_ratio'].append(batch_effective_token_ratio)
 
             if is_update_step:
-                if is_dist():
-                    update_tokens = torch.tensor(
-                        float(accumulated_tokens_for_update_local),
-                        device=device,
-                        dtype=torch.float64,
-                    )
-                    dist.all_reduce(update_tokens, op=dist.ReduceOp.SUM)
-                    update_tokens_global = int(update_tokens.item())
-                else:
-                    update_tokens_global = int(accumulated_tokens_for_update_local)
-                global_consumed_tokens += update_tokens_global
-                accumulated_tokens_for_update_local = 0
+                if step_effective_tokens_value is None:
+                    raise ValueError("Missing step effective-token count on update step.")
+                global_consumed_tokens += step_effective_tokens_value
             
             if (
                 train_cfg.eval_in_epochs
@@ -1055,7 +1085,7 @@ def train(train_cfg, vlm_cfg, model_mode: str = "nanovlm"):
             ):
                 # ALL RANKS: Perform collective operations for training stats
                 stats = {}
-                for key in ['tokens_per_second', 'data_load_time', 'fw_bw_time', 'post_process_time', 'images_per_sample', 'effective_token_ratio_per_instance']:
+                for key in ['tokens_per_second', 'data_load_time', 'fw_bw_time', 'post_process_time', 'images_per_sample', 'effective_token_ratio']:
                     if is_dist():
                         all_values = dist_gather(accumulated_stats[key])
                         all_values_flat = [item for sublist in all_values for item in sublist]  # Flatten list of lists
@@ -1101,7 +1131,7 @@ def train(train_cfg, vlm_cfg, model_mode: str = "nanovlm"):
                         f"[TRAIN] step={step_after_update} "
                         f"batch_loss={batch_loss:.4f} "
                         f"step_loss={update_loss_text:.4f} "
-                        f"effective_token_ratio_per_instance={step_effective_ratio_text:.4f} "
+                        f"effective_token_ratio={step_effective_ratio_text:.4f} "
                         f"tokens_per_second={stats['avg_tokens_per_second']:.2f} "
                         f"lr_mp={stats.get('lr_mp', 0.0):.6g} "
                         f"lr_vision={stats.get('lr_vision_backbone', 0.0):.6g} "
@@ -1120,21 +1150,40 @@ def train(train_cfg, vlm_cfg, model_mode: str = "nanovlm"):
                 # ALL RANKS: gather loss from all ranks if DDP
                 microbatch_loss_for_log = batch_loss
                 step_loss_for_log = update_loss_value if update_loss_value is not None else batch_loss
+                microbatch_effective_tokens_for_log = batch_effective_tokens
+                microbatch_token_capacity_for_log = batch_token_capacity
                 microbatch_effective_ratio_for_log = batch_effective_token_ratio
                 step_effective_ratio_for_log = (
                     step_effective_token_ratio_value
                     if step_effective_token_ratio_value is not None
                     else batch_effective_token_ratio
                 )
+                if step_effective_tokens_value is None or step_token_capacity_value is None:
+                    raise ValueError("Missing step effective token metrics on update step.")
                 if is_dist():
                     microbatch_loss_gathered = dist_mean_scalar(microbatch_loss_for_log)
                     step_loss_gathered = dist_mean_scalar(step_loss_for_log)
-                    microbatch_effective_ratio_gathered = dist_mean_scalar(microbatch_effective_ratio_for_log)
-                    step_effective_ratio_gathered = dist_mean_scalar(step_effective_ratio_for_log)
+                    microbatch_effective_tokens_gathered = dist_sum_scalar(microbatch_effective_tokens_for_log)
+                    microbatch_token_capacity_gathered = dist_sum_scalar(microbatch_token_capacity_for_log)
+                    microbatch_effective_ratio_gathered = compute_effective_token_ratio(
+                        microbatch_effective_tokens_gathered,
+                        microbatch_token_capacity_gathered,
+                    )
+                    # Step-level values are already globalized at update-step reduction time.
+                    step_effective_tokens_gathered = step_effective_tokens_value
+                    step_token_capacity_gathered = step_token_capacity_value
+                    step_effective_ratio_gathered = compute_effective_token_ratio(
+                        step_effective_tokens_gathered,
+                        step_token_capacity_gathered,
+                    )
                 else:
                     microbatch_loss_gathered = microbatch_loss_for_log
                     step_loss_gathered = step_loss_for_log
+                    microbatch_effective_tokens_gathered = microbatch_effective_tokens_for_log
+                    microbatch_token_capacity_gathered = microbatch_token_capacity_for_log
                     microbatch_effective_ratio_gathered = microbatch_effective_ratio_for_log
+                    step_effective_tokens_gathered = step_effective_tokens_value
+                    step_token_capacity_gathered = step_token_capacity_value
                     step_effective_ratio_gathered = step_effective_ratio_for_log
                     
                 # MASTER ONLY: Log to wandb
@@ -1143,8 +1192,12 @@ def train(train_cfg, vlm_cfg, model_mode: str = "nanovlm"):
                         "train/consumed_tokens": global_consumed_tokens,
                         "train/batch_loss": microbatch_loss_gathered,
                         "train/step_loss": step_loss_gathered,
-                        "train/batch_effective_token_ratio_per_instance": microbatch_effective_ratio_gathered,
-                        "train/step_effective_token_ratio_per_instance": step_effective_ratio_gathered,
+                        "train/batch_effective_tokens": microbatch_effective_tokens_gathered,
+                        "train/batch_token_capacity": microbatch_token_capacity_gathered,
+                        "train/batch_effective_token_ratio": microbatch_effective_ratio_gathered,
+                        "train/step_effective_tokens": step_effective_tokens_gathered,
+                        "train/step_token_capacity": step_token_capacity_gathered,
+                        "train/step_effective_token_ratio": step_effective_ratio_gathered,
                         **({"grad_norm": grad_norm_value} if grad_norm_value is not None else {})
                     }, step=step_after_update)
                 

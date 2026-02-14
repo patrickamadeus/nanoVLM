@@ -303,3 +303,44 @@ Validation:
 
 - Configs: `configs/train.current.momh.compile-selective.yaml`, `configs/train.preflight.momh.checkpoint-load.yaml`, `configs/train.preflight.momh.stability.yaml`, `configs/train.preflight.momh.compile-selective.yaml`
 - Code: `train.py`
+
+## 2026-02-14 — Effective-Token Metric Contract Simplified to Non-Pad Tokens
+
+**Type:** Configuration
+**General description:** Replaced the legacy effective-token metric path with a single non-pad-token definition to match packing verification intent.
+
+### Details
+
+Metric contract update:
+- Effective tokens are now defined strictly as `attention_mask == 1` (non-pad tokens).
+- Removed legacy per-instance metric path that mixed supervision density with packing utilization.
+
+Training metric/logging changes in `train.py`:
+- Added explicit batch/step effective-token counters and capacity counters.
+- New primary metrics:
+  - `train/batch_effective_tokens`
+  - `train/batch_token_capacity`
+  - `train/batch_effective_token_ratio`
+  - `train/step_effective_tokens`
+  - `train/step_token_capacity`
+  - `train/step_effective_token_ratio`
+- Updated stats aggregate key to `training_stats/avg_effective_token_ratio`.
+- Removed legacy keys:
+  - `train/batch_effective_token_ratio_per_instance`
+  - `train/step_effective_token_ratio_per_instance`
+  - `training_stats/avg_effective_token_ratio_per_instance`
+
+Documentation updates:
+- `README.md` now states effective tokens are non-pad tokens and documents step-ratio formula.
+- `references/troubleshooting.md` includes an entry clarifying the prior metric-definition mismatch.
+
+### Key Points
+
+- Packing effectiveness and supervision density are no longer conflated in one KPI.
+- `train/consumed_tokens` remains aligned with effective non-pad token counting.
+- This is a breaking telemetry rename for dashboards relying on old `*_per_instance` keys.
+
+### Links
+
+- Code: `train.py`
+- Docs: `README.md`, `references/troubleshooting.md`

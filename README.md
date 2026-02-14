@@ -159,7 +159,8 @@ python train.py --dualtower --left_tower_mask_mode full
 
 `train.py` computes loss with `loss_reduction="sum"` and normalizes updates/metrics by the number of valid target tokens (`labels != -100`) across gradient accumulation (and across all ranks in DDP).
 When logging, `train/batch_loss` is the current microbatch token-normalized loss, and `train/step_loss` is the token-normalized loss used for the optimizer step.
-It also logs `effective_token_ratio_per_instance = mean_i(valid_target_tokens_i / attention_tokens_i)` for training.
+Effective-token metrics now use one definition only: non-pad tokens (`attention_mask == 1`).
+The primary KPI is `train/step_effective_token_ratio = train/step_effective_tokens / train/step_token_capacity`.
 
 ## Generate
 

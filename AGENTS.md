@@ -9,13 +9,12 @@ This document defines the operational contract for AI agents working in this pro
 
 ## 1. Project Context
 
-**Purpose:** The goal is to use proper activation checkpointing on top of torch.compile using selective activation checkpointing (or regular checkpointing) since we are still doing very slow. Utilize compiled_resources and skills to understand how to speed up our training and inference. We will also use the retrospective skill to capture learnings and create new skills based on those learnings.
+**Purpose:** I want to check the packing implementation or the way we count the effective token is correct or not. This is because the current implementation of packing is not giving us the expected speedup and I want to make sure that the implementation is correct before we start finetuning with packing. Our implementation right now gives as low as 0.1 effective token ratio, which is very low and we want to make sure that this is not due to a bug in our implementation. The naming is weird anwyay, it's called effective_token_per_sample. Which makes it sound like the effective token per data. But what I want is effective token per batch or per step.
 
-Please use MCP to see whether we speed up the training while also still have the same training as the previous run. We have 2 runs for reference :
-1. https://wandb.ai/patrickirawan-mbzuai/dualtower-debug/runs/qqiatehi?nw=nwusererlandpg -> Compiled version with this config /workspace/nanoVLM_root/nanoVLM_main/configs/train.small_debug.momh.yaml
-2. https://wandb.ai/patrickirawan-mbzuai/dualtower-debug/runs/n1bvvbmm?nw=nwusererlandpg -> Uncompiled version with this config /workspace/nanoVLM_root/nanoVLM_main/configs/train.small_debug.momh.yaml
+Please use MCP to see the reference run with low ratio of effective token :
+1. https://wandb.ai/patrickirawan-mbzuai/momh/runs/s9snut2s?nw=nwusererlandpg 
 
-You also need to use the same config after fixing the activation checkpointing.compile. Please run after every fixing and see what's the performance gain. We need to minimize both compile time and training time.
+Never use CPU in any way! Contant user if something's wrong with the GPU. But never EVER run in CPU because it keeps crashing my machine.
 
 **Domain:** ML research and experimentation
 
