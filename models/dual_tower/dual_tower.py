@@ -5,12 +5,13 @@ import json
 import os
 import tempfile
 from dataclasses import asdict
-from safetensors.torch import load_model as load_safetensors, save_model
+from safetensors.torch import save_model
 from models.language_model import LanguageModel
 from models.vision_language_model import VisionLanguageModel
 from models.config import VLMConfig
 from models.utils import top_k_top_p_filtering
-from models.compiler import _apply_regional_compile, _compile_modulelist_blocks, _maybe_mark_batch_dynamic
+from models.compiler import _apply_regional_compile
+from models.safetensors_compat import load_model_with_compile_key_compat
 from train_utils.console import rank0_print
 from huggingface_hub import create_repo, hf_hub_download, upload_folder
 
@@ -427,11 +428,16 @@ class DualTowerVLM(nn.Module):
         cfg = VLMConfig(**cfg_dict)
 
         model = cls(cfg, load_backbone=load_backbone, **model_kwargs)
-        try:
-            load_safetensors(model, weights_path)
-        except:
-            model, _ = _apply_regional_compile(model)
-            load_safetensors(model, weights_path)
+        load_summary = load_model_with_compile_key_compat(
+            model,
+            weights_path,
+            compile_model_for_compiled_wrapper_keys=_apply_regional_compile,
+        )
+        if load_summary["compiled_wrapper_keys"]:
+            rank0_print(
+                "[INFO] Checkpoint uses compiled-wrapper keys (._orig_mod.); "
+                "applied regional compile before loading checkpoint weights."
+            )
 
         model = model.to(device)
         return model

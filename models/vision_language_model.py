@@ -11,14 +11,15 @@ from models.language_model import LanguageModel
 from models.modality_projector import ModalityProjector
 from models.momh_attention import create_momh_block_mask_from_modality
 from models.config import VLMConfig
-from models.compiler import _apply_regional_compile, _compile_modulelist_blocks, _maybe_mark_batch_dynamic
+from models.compiler import _apply_regional_compile
+from models.safetensors_compat import load_model_with_compile_key_compat
 
 from data.processors import get_tokenizer
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from safetensors.torch import load_model, save_model
+from safetensors.torch import save_model
 
 
 class VisionLanguageModel(nn.Module):
@@ -330,12 +331,12 @@ class VisionLanguageModel(nn.Module):
             cfg = VLMConfig(**json.load(f))
         # Initialize model without loading the backbone
         model = cls(cfg, load_backbone=False)
-        try:
-            # Load safetensors weights
-            load_model(model, weights_path)
-        except:
-            model, _ = _apply_regional_compile(model)
-            load_model(model, weights_path)
+        # For legacy compiled checkpoints, compile first then load.
+        load_model_with_compile_key_compat(
+            model,
+            weights_path,
+            compile_model_for_compiled_wrapper_keys=_apply_regional_compile,
+        )
 
         # Done!
         return model

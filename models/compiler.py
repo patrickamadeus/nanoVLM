@@ -1,10 +1,44 @@
 import torch
 
+
+class _CompiledBlockWrapper(torch.nn.Module):
+    def __init__(self, block: torch.nn.Module, *, fullgraph: bool):
+        super().__init__()
+        self._orig_mod = block
+        self._compiled_forward = torch.compile(block.forward, fullgraph=fullgraph)
+
+    def forward(self, *args, **kwargs):
+        return self._compiled_forward(*args, **kwargs)
+
+    def __getattr__(self, name):
+        try:
+            return super().__getattr__(name)
+        except AttributeError as exc:
+            if name.startswith("_"):
+                raise exc
+            orig_mod = super().__getattr__("_orig_mod")
+            return getattr(orig_mod, name)
+
+
+def _compile_block_module(block, *, fullgraph: bool):
+    if isinstance(block, _CompiledBlockWrapper):
+        return block, False
+    if not isinstance(block, torch.nn.Module):
+        raise TypeError(
+            f"Expected torch.nn.Module block, got {type(block).__name__}"
+        )
+    return _CompiledBlockWrapper(block, fullgraph=fullgraph), True
+
+
 def _compile_modulelist_blocks(module_list, *, fullgraph: bool):
     compiled_count = 0
     for idx, block in enumerate(module_list):
-        module_list[idx] = torch.compile(block, fullgraph=fullgraph)
-        compiled_count += 1
+        compiled_block, was_compiled = _compile_block_module(
+            block, fullgraph=fullgraph
+        )
+        if was_compiled:
+            module_list[idx] = compiled_block
+            compiled_count += 1
     return compiled_count
 
 
@@ -30,8 +64,7 @@ def _apply_regional_compile(model):
         summary["compiled"]["left_tower_vision_blocks"] = 0
         summary["compiled"]["left_tower_mp"] = 0
         return model, summary
-
-    if "VisionLanguageModel" in model.__class__.__name__:
+    elif "VisionLanguageModel" in model.__class__.__name__:
         summary["compiled"]["decoder_blocks"] = _compile_modulelist_blocks(
             model.decoder.blocks,
             fullgraph=compile_fullgraph,
