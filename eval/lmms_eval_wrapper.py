@@ -18,6 +18,7 @@ from lmms_eval.api.instance import Instance
 from models.vision_language_model import VisionLanguageModel
 from data.processors import get_tokenizer, get_image_processor, get_image_string
 from models.dual_tower.dual_tower import DualTowerVLM
+from models.config import VLMConfig
 
 
 class NanoVLMWrapper(lmms):

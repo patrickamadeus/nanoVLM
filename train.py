@@ -324,7 +324,7 @@ def get_dataloaders(train_cfg, vlm_cfg):
         train_dataset,
         batch_size=train_cfg.batch_size,    # =per device BS in DDP
         collate_fn=vqa_collator,
-        num_workers=2,
+        num_workers=1,
         pin_memory=False,
         persistent_workers=False,
         drop_last=True,
@@ -336,7 +336,7 @@ def get_dataloaders(train_cfg, vlm_cfg):
         val_dataset,
         batch_size=train_cfg.batch_size,
         collate_fn=vqa_collator,
-        num_workers=2,
+        num_workers=1,
         pin_memory=False,
         persistent_workers=False,
         drop_last=True,

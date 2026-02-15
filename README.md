@@ -151,6 +151,11 @@ source .venv/bin/activate
 python eval/check_momh_mask.py --mode dataloader --config configs/train.small_debug.momh.yaml
 ```
 `cross_segment_allowed_count > 0` means packed samples are not segment-isolated by current masking.
+To inspect response-only supervision masking (`labels != -100`) on one packed batch:
+```bash
+source .venv/bin/activate
+python eval/inspect_response_mask_packing.py --config configs/train.small_debug.momh.yaml --split train --row-index 0
+```
 
 To explicitly select architecture mode:
 ```bash

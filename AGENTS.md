@@ -9,10 +9,23 @@ This document defines the operational contract for AI agents working in this pro
 
 ## 1. Project Context
 
-**Purpose:** I want to check the packing implementation or the way we count the effective token is correct or not. This is because the current implementation of packing is not giving us the expected speedup and I want to make sure that the implementation is correct before we start finetuning with packing. Our implementation right now gives as low as 0.1 effective token ratio, which is very low and we want to make sure that this is not due to a bug in our implementation. The naming is weird anwyay, it's called effective_token_per_sample. Which makes it sound like the effective token per data. But what I want is effective token per batch or per step.
+**Purpose:** I am training momH right now which is currently running. momH is where we differentiate the attention patters for multimodal inputs. By differentiating the heads of which modality they attend to, we hope that this will increase the modality imbalance performance and also the overall performance of the model.
+
+The settings right now is that we load the checkpoint of the vanilla nanoVLM and then we finetune it with the momH attention pattern. We would expect that the performance will go down first and then it will go up as the model learns to use the new attention pattern. We are currently at the point where the performance is still going down but we hope that it will start going up soon.
+
+But currently we have suspicion since the performance is too low. We are thinking that packing is the causes here. So I want you to help me investigate it. It might be incompatible with the response only style of nanoVLM
 
 Please use MCP to see the reference run with low ratio of effective token :
-1. https://wandb.ai/patrickirawan-mbzuai/momh/runs/s9snut2s?nw=nwusererlandpg 
+1. https://wandb.ai/patrickirawan-mbzuai/momh/runs/dt6j0j2n
+
+This is downstream performance for that run :
+1. /home/yovakementchedjhieva/users/patrick/nanoVLM_root/refactor/eval_results/momh-2k1img-step-2800/20260215_172854_samples_mmstar.jsonl
+2. /home/yovakementchedjhieva/users/patrick/nanoVLM_root/refactor/eval_results/momh-2k1img-step-2800/20260215_172854_results.json
+
+Note that for vanilla model but we changed the attention to momH. The result is :
+1. /home/yovakementchedjhieva/users/patrick/nanoVLM_root/refactor/eval_results/nanoVLM-230M-8k/20260215_033305_samples_mmstar.jsonl
+2. /home/yovakementchedjhieva/users/patrick/nanoVLM_root/refactor/eval_results/nanoVLM-230M-8k/20260215_033305_results.json
+
 
 Never use CPU in any way! Contant user if something's wrong with the GPU. But never EVER run in CPU because it keeps crashing my machine.
 
