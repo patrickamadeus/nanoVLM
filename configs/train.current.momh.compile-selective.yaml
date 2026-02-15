@@ -163,5 +163,5 @@ train:
   push_checkpoints_to_hub: true
   hf_private: false
   push_final_model_to_hub: false
-  continue_from_checkpoint: /home/erland.fuadi/Python_project/nanoVLM/checkpoints/momh-compile-selective-nopack_nanoVLM_siglip2-base-patch16-512_2048_mp4_SmolLM2-135M-Instruct_4xGPU_bs128_20000_lr_vision_0.0-language_1e-05-5e-05_0215-160152/step-00003000-tokens-000156149614
-  resume_from_vlm_checkpoint: false
+  resume_from_vlm_checkpoint: true
+  # continue_from_checkpoint: /home/erland.fuadi/Python_project/nanoVLM/checkpoints/momh-compile-selective-nopack_nanoVLM_siglip2-base-patch16-512_2048_mp4_SmolLM2-135M-Instruct_4xGPU_bs128_20000_lr_vision_0.0-language_1e-05-5e-05_0215-160152/step-00003000-tokens-000156149614

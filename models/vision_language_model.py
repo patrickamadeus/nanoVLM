@@ -11,6 +11,7 @@ from models.language_model import LanguageModel
 from models.modality_projector import ModalityProjector
 from models.momh_attention import create_momh_block_mask_from_modality
 from models.config import VLMConfig
+from models.compiler import _apply_regional_compile, _compile_modulelist_blocks, _maybe_mark_batch_dynamic
 
 from data.processors import get_tokenizer
 
@@ -19,49 +20,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from safetensors.torch import load_model, save_model
 
-def _compile_modulelist_blocks(module_list, *, fullgraph: bool):
-    compiled_count = 0
-    for idx, block in enumerate(module_list):
-        module_list[idx] = torch.compile(block, fullgraph=fullgraph)
-        compiled_count += 1
-    return compiled_count
-
-
-def _apply_regional_compile(model):
-    compile_fullgraph = True
-    summary = {
-        "strategy": "regional_submodule_compile_fullgraph",
-        "fullgraph": compile_fullgraph,
-        "compiled": {},
-    }
-
-    # if isinstance(model, DualTowerVLM):
-    #     summary["compiled"]["left_tower_decoder_blocks"] = _compile_modulelist_blocks(
-    #         model.left_tower.decoder.blocks,
-    #         fullgraph=compile_fullgraph,
-    #     )
-    #     summary["compiled"]["right_tower_decoder_blocks"] = _compile_modulelist_blocks(
-    #         model.right_tower.blocks,
-    #         fullgraph=compile_fullgraph,
-    #     )
-    #     # Keep vision/projector eager: packed-image count varies by batch and can
-    #     # trigger repeated recompiles on image-batch dimension.
-    #     summary["compiled"]["left_tower_vision_blocks"] = 0
-    #     summary["compiled"]["left_tower_mp"] = 0
-    #     return model, summary
-
-    if isinstance(model, VisionLanguageModel):
-        summary["compiled"]["decoder_blocks"] = _compile_modulelist_blocks(
-            model.decoder.blocks,
-            fullgraph=compile_fullgraph,
-        )
-        summary["compiled"]["vision_blocks"] = 0
-        summary["compiled"]["mp"] = 0
-        return model, summary
-
-    raise ValueError(
-        f"Unsupported model type for regional compile: {type(model).__name__}"
-    )
 
 class VisionLanguageModel(nn.Module):
     def __init__(self, cfg: VLMConfig, load_backbone=True):

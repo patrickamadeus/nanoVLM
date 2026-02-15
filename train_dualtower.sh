@@ -8,7 +8,7 @@ set -euo pipefail
 export HF_HOME=/nfs-stor/alham.fikri/huggingface
 
 # python train.py --checkpoint_interval 200 --dualtower
-torchrun --standalone --nproc_per_node=4 --nnodes=1 train.py --config /home/alham.fikri/patrick.amadeus/nanoVLM_edd_root/nanoVLM_edd_main/configs/train.current.momh.compile-selective.yaml
+torchrun --standalone --nproc_per_node=4 --nnodes=1 train.py --config /home/alham.fikri/patrick.amadeus/nanoVLM_edd_root/nanoVLM_edd_main/configs/dualtower.nopack.yaml
 
 # srun torchrun --nproc_per_node=$SLURM_GPUS_PER_NODE \
 #     --nnodes=$SLURM_NNODES \

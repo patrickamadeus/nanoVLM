@@ -10,6 +10,7 @@ from models.language_model import LanguageModel
 from models.vision_language_model import VisionLanguageModel
 from models.config import VLMConfig
 from models.utils import top_k_top_p_filtering
+from models.compiler import _apply_regional_compile, _compile_modulelist_blocks, _maybe_mark_batch_dynamic
 from train_utils.console import rank0_print
 from huggingface_hub import create_repo, hf_hub_download, upload_folder
 
@@ -426,7 +427,12 @@ class DualTowerVLM(nn.Module):
         cfg = VLMConfig(**cfg_dict)
 
         model = cls(cfg, load_backbone=load_backbone, **model_kwargs)
-        load_safetensors(model, weights_path)
+        try:
+            load_safetensors(model, weights_path)
+        except:
+            model, _ = _apply_regional_compile(model)
+            load_safetensors(model, weights_path)
+
         model = model.to(device)
         return model
 

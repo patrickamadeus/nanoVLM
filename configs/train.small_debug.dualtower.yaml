@@ -121,7 +121,7 @@ train:
   lr_left_tower: null
   lr_right_tower: 0.0
   val_size: 50000
-  batch_size: 4
+  batch_size: 16
   gradient_accumulation_steps: 4
   max_grad_norm: 1.0
   eval_in_epochs: true
@@ -133,15 +133,14 @@ train:
   max_images_per_knapsack: 8
   max_sample_length: 512
   use_packing: true
-  compile: fals  activation_checkpointing: false
-  activation_checkpointing_mode: "regular"e
+  compile: true
   resume_from_vlm_checkpoint: false
   train_dataset_path: patrickamadeus/the_cauldron
   train_dataset_name:
   - sample_1pct
   train_split: train
   val_split: validation
-  stream_dataset: false
+  stream_dataset: true
   relevance_min_rating: 1
   image_correspondence_min_rating: 1
   visual_dependency_min_rating: 1
@@ -149,7 +148,7 @@ train:
   wandb_entity: patrickirawan-mbzuai
   wandb_project: "dualtower-debug"
   wandb_run_name_prefix: "debug"
-  log_wandb: true
+  log_wandb: false
   use_lmms_eval: false
   lmms_eval_tasks: mmstar,mmmu_val,ocrbench,textvqa_val,docvqa_val,scienceqa,mme,infovqa_val,chartqa
   lmms_eval_limit: null

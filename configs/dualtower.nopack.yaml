@@ -14,7 +14,7 @@ vlm:
   lm_inter_dim: 2560
   lm_rms_eps: 1.0e-05
   lm_re_base: 100000
-  lm_max_position_embeddings: 8192
+  lm_max_position_embeddings: 2048
   lm_base_vocab_size: 49152
   extra_token_amount: 66
   lm_vocab_size: 49218
@@ -23,7 +23,7 @@ vlm:
   lm_dropout: 0.0
   lm_n_blocks: 32
   lm_attn_scaling: 1.0
-  lm_max_length: 8192
+  lm_max_length: 2048
   lm_use_tokens: false
   lm_tie_weights: true
   lm_model_type: HuggingFaceTB/SmolLM2-135M-Instruct
@@ -38,6 +38,11 @@ vlm:
     '' }}{% endif %}'
   mp_pixel_shuffle_factor: 4
   mp_image_token_length: 64
+  momh_enabled: false
+  momh_head_pct_vision: 0.2
+  momh_head_pct_text: 0.3
+  activation_checkpointing: true
+  activation_checkpointing_mode: "regular"
   max_img_size: 2048
   resize_to_max_side_len: false
   vlm_extra_tokens:
@@ -112,26 +117,31 @@ vlm:
   hf_repo_name: nanoVLM
   left_tower_mask_mode: visual_only
 train:
-  lr_mp: 0.0005
+  lr_mp: 0.00005
   lr_vision_backbone: 0
-  lr_language_backbone: 0.0001
+  lr_language_backbone: 0.00001
   lr_left_tower: null
   lr_right_tower: 0.0
   val_size: 50000
-  batch_size: 4
-  gradient_accumulation_steps: 16
+  batch_size: 8
+  gradient_accumulation_steps: 4
   max_grad_norm: 1.0
-  eval_in_epochs: true
+  eval_in_epochs: false
+  eval_unit: "steps"
   eval_interval: 500
-  checkpoint_interval: 500
+  checkpoint_unit: "steps"
+  checkpoint_interval: 200
+  checkpoint_dir: "checkpoints"
+  checkpoint_repo_pattern: patrickamadeus/dual-2k1img-step-{i}
+  keep_last_n_checkpoints: 1
   stats_log_interval: 100
+  stop_unit: "steps"
   max_training_steps: 20000
   max_images_per_example: 1
   max_images_per_knapsack: 18
-  max_sample_length: 8192
-  use_packing: true
+  max_sample_length: 2048
+  use_packing: false
   compile: true
-  resume_from_vlm_checkpoint: true
   train_dataset_path: patrickamadeus/the_cauldron
   train_dataset_name:
   - all
@@ -142,13 +152,16 @@ train:
   image_correspondence_min_rating: 1
   visual_dependency_min_rating: 1
   formatting_min_rating: 1
-  wandb_entity: HuggingFace
+  wandb_entity: patrickirawan-mbzuai
+  wandb_project: "dualtower"
+  wandb_run_name_prefix: "dualtower-nopack"
   log_wandb: true
   use_lmms_eval: false
   lmms_eval_tasks: mmstar,mmmu_val,ocrbench,textvqa_val,docvqa_val,scienceqa,mme,infovqa_val,chartqa
   lmms_eval_limit: null
   lmms_eval_batch_size: 64
   push_checkpoints_to_hub: true
-  checkpoint_repo_pattern: patrickamadeus/dt8k1img-ref-step-{i}
   hf_private: false
   push_final_model_to_hub: false
+  continue_from_checkpoint: "/home/alham.fikri/patrick.amadeus/nanoVLM_edd_root/nanoVLM_edd_main/checkpoints/dualtower-nopack_nanoVLM_siglip2-base-patch16-512_2048_mp4_SmolLM2-135M-Instruct_4xGPU_bs128_20000_lr_vision_0.0-language_1e-05-5e-05_0215-173050/step-00000400-tokens-000020804742"
+  resume_from_vlm_checkpoint: false
