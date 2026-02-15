@@ -26,7 +26,7 @@ if torch.cuda.is_available():
 
 PG_CPU = None
 
-from data.datasets import VQADataset
+from data.datasets import StreamingVQADataset, VQADataset
 from data.collators import VQACollator
 from data.data_utils import synchronized_dataloader_step
 from data.advanced_datasets import ConstantLengthDataset
@@ -201,8 +201,8 @@ def get_dataloaders(train_cfg, vlm_cfg):
         raise ValueError(
             f"max_sample_length ({train_cfg.max_sample_length}) must be <= lm_max_length ({vlm_cfg.lm_max_length})"
         )
-    if not train_cfg.use_packing and train_cfg.stream_dataset:
-        raise ValueError("stream_dataset=True requires use_packing=True in the current dataloader pipeline.")
+    # if not train_cfg.use_packing and train_cfg.stream_dataset:
+    #     raise ValueError("stream_dataset=True requires use_packing=True in the current dataloader pipeline.")
     # Create datasets
     image_processor = get_image_processor(vlm_cfg.max_img_size, vlm_cfg.vit_img_size, vlm_cfg.resize_to_max_side_len)
     tokenizer = get_tokenizer(
@@ -263,11 +263,16 @@ def get_dataloaders(train_cfg, vlm_cfg):
 
 
     if is_dist():  # We need to shard the dataset in DDP since we are using an iterable dataset instead of the distributed sampler
-        print("GET WORLD SIZE DIST", get_world_size())
         train_ds = train_ds.shard(num_shards=get_world_size(), index=get_rank())
         val_ds = val_ds.shard(num_shards=get_world_size(), index=get_rank())
 
-    train_dataset = VQADataset(
+    dataset_cls = (
+        StreamingVQADataset
+        if train_cfg.stream_dataset and not train_cfg.use_packing
+        else VQADataset
+    )
+
+    train_dataset = dataset_cls(
         train_ds,
         tokenizer,
         image_processor,
@@ -277,7 +282,7 @@ def get_dataloaders(train_cfg, vlm_cfg):
         train_cfg.visual_dependency_min_rating,
         train_cfg.formatting_min_rating,
     )
-    val_dataset = VQADataset(
+    val_dataset = dataset_cls(
         val_ds,
         tokenizer,
         image_processor,
@@ -324,7 +329,7 @@ def get_dataloaders(train_cfg, vlm_cfg):
         train_dataset,
         batch_size=train_cfg.batch_size,    # =per device BS in DDP
         collate_fn=vqa_collator,
-        num_workers=1,
+        num_workers=2,
         pin_memory=False,
         persistent_workers=False,
         drop_last=True,
@@ -336,7 +341,7 @@ def get_dataloaders(train_cfg, vlm_cfg):
         val_dataset,
         batch_size=train_cfg.batch_size,
         collate_fn=vqa_collator,
-        num_workers=1,
+        num_workers=2,
         pin_memory=False,
         persistent_workers=False,
         drop_last=True,

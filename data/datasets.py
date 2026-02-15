@@ -1,5 +1,5 @@
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, IterableDataset
 from data.processors import get_image_string
 from data.image_utils import coerce_image_to_pil
 import logging
@@ -146,3 +146,16 @@ class VQADataset(BaseDataset):  # Visual Question Answering Dataset
         labels[-1] = -100 # Last token has no target
         
         return labels
+
+
+class StreamingVQADataset(VQADataset, IterableDataset):
+    """
+    Iterable wrapper used when stream_dataset=true and use_packing=false.
+    This avoids map-style indexing against HuggingFace IterableDataset.
+    """
+
+    def __iter__(self):
+        yield from self.iter_for_worker()
+
+    def __len__(self):
+        raise TypeError("StreamingVQADataset has no length in streaming mode.")
