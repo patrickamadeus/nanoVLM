@@ -123,8 +123,8 @@ train:
   lr_left_tower: null
   lr_right_tower: 0.0
   val_size: 50000
-  batch_size: 16
-  gradient_accumulation_steps: 8
+  batch_size: 8
+  gradient_accumulation_steps: 4
   max_grad_norm: 1.0
   eval_in_epochs: true
   eval_unit: "steps"
@@ -132,7 +132,7 @@ train:
   checkpoint_unit: "steps"
   checkpoint_interval: 200
   checkpoint_dir: "checkpoints"
-  checkpoint_repo_pattern: patrickamadeus/momh-2k1img-step-{i}
+  checkpoint_repo_pattern: patrickamadeus/momh-2k1img-step-nopack-cont3000-{i}
   keep_last_n_checkpoints: 1
   stats_log_interval: 100
   stop_unit: "steps"
@@ -140,22 +140,21 @@ train:
   max_images_per_example: 1
   max_images_per_knapsack: 18
   max_sample_length: 2048
-  use_packing: true
+  use_packing: false
   compile: true
-  resume_from_vlm_checkpoint: true
   train_dataset_path: patrickamadeus/the_cauldron
   train_dataset_name:
   - all
   train_split: train
   val_split: validation
-  stream_dataset: false
+  stream_dataset: true
   relevance_min_rating: 1
   image_correspondence_min_rating: 1
   visual_dependency_min_rating: 1
   formatting_min_rating: 1
   wandb_entity: patrickirawan-mbzuai
   wandb_project: "momh"
-  wandb_run_name_prefix: "momh-compile-selective"
+  wandb_run_name_prefix: "momh-compile-selective-nopack"
   log_wandb: true
   use_lmms_eval: false
   lmms_eval_tasks: mmstar,mmmu_val,ocrbench,textvqa_val,docvqa_val,scienceqa,mme,infovqa_val,chartqa
@@ -164,3 +163,5 @@ train:
   push_checkpoints_to_hub: true
   hf_private: false
   push_final_model_to_hub: false
+  continue_from_checkpoint: /home/erland.fuadi/Python_project/nanoVLM/checkpoints/momh-compile-selective-nopack_nanoVLM_siglip2-base-patch16-512_2048_mp4_SmolLM2-135M-Instruct_4xGPU_bs128_20000_lr_vision_0.0-language_1e-05-5e-05_0215-160152/step-00003000-tokens-000156149614
+  resume_from_vlm_checkpoint: false

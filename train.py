@@ -129,7 +129,7 @@ def dist_sum_scalar(x: float | int) -> float:
 
 def wrap_model(model):
     local_rank = int(os.environ["LOCAL_RANK"])
-    return DistributedDataParallel(model, device_ids=[local_rank], output_device=local_rank,find_unused_parameters=True)
+    return DistributedDataParallel(model, device_ids=[local_rank], output_device=local_rank,find_unused_parameters=False)
 
 def get_run_name(train_cfg, vlm_cfg):
     batch_size = f"bs{int(train_cfg.batch_size*get_world_size()*train_cfg.gradient_accumulation_steps)}"
@@ -300,7 +300,7 @@ def get_dataloaders(train_cfg, vlm_cfg):
             max_sample_length=train_cfg.max_sample_length,
             seq_length=vlm_cfg.lm_max_length,
             num_of_sequences=train_cfg.batch_size * 4,
-            queue_size=2,
+            queue_size=4,
             max_images_per_example=train_cfg.max_images_per_example,
             max_images_per_knapsack=train_cfg.max_images_per_knapsack,
         )
@@ -311,7 +311,7 @@ def get_dataloaders(train_cfg, vlm_cfg):
             max_sample_length=train_cfg.max_sample_length,
             seq_length=vlm_cfg.lm_max_length,
             num_of_sequences=train_cfg.batch_size * 4,
-            queue_size=2,
+            queue_size=4,
             max_images_per_example=train_cfg.max_images_per_example,
             max_images_per_knapsack=train_cfg.max_images_per_knapsack,
         )
@@ -329,9 +329,9 @@ def get_dataloaders(train_cfg, vlm_cfg):
         train_dataset,
         batch_size=train_cfg.batch_size,    # =per device BS in DDP
         collate_fn=vqa_collator,
-        num_workers=2,
-        pin_memory=False,
-        persistent_workers=False,
+        num_workers=4,
+        pin_memory=True,
+        persistent_workers=True,
         drop_last=True,
         worker_init_fn=seed_worker,
         generator=g,
@@ -341,9 +341,9 @@ def get_dataloaders(train_cfg, vlm_cfg):
         val_dataset,
         batch_size=train_cfg.batch_size,
         collate_fn=vqa_collator,
-        num_workers=2,
-        pin_memory=False,
-        persistent_workers=False,
+        num_workers=4,
+        pin_memory=True,
+        persistent_workers=True,
         drop_last=True,
         worker_init_fn=seed_worker,
         generator=g,

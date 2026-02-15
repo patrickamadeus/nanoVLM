@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-: "${WANDB_API_KEY:?Set WANDB_API_KEY before running train.sh}"
-: "${HF_TOKEN:?Set HF_TOKEN before running train.sh}"
-export HF_HOME="${HF_HOME:-/workspace/huggingface}"
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
+# : "${WANDB_API_KEY:?Set WANDB_API_KEY before running train.sh}"
+# : "${HF_TOKEN:?Set HF_TOKEN before running train.sh}"
+export HF_HOME="${HF_HOME:-/nfs-stor/erland.fuadi/huggingface}"
+# export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
 
 # python train.py --checkpoint_interval 200 --dualtower
-torchrun --standalone --nproc_per_node=2 --nnodes=1 train.py --checkpoint_interval 100 --dualtower
+torchrun --standalone --nproc_per_node=4 --nnodes=1 train.py --config configs/train.current.momh.compile-selective.yaml
 
 # srun torchrun --nproc_per_node=$SLURM_GPUS_PER_NODE \
 #     --nnodes=$SLURM_NNODES \

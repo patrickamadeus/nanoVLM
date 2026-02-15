@@ -1,11 +1,10 @@
 export HF_HOME=~/users/patrick/huggingface
-: "${HF_TOKEN:?Set HF_TOKEN in environment before running evaluation.sh}"
-export HF_TOKEN
+# : "${HF_TOKEN:?Set HF_TOKEN in environment before running evaluation.sh}"
 export CUDA_VISIBLE_DEVICES=0
 LIMIT=100
 TASKS=mmstar
 BATCH_SIZE=16
-CP=patrickamadeus/momh-2k1img-step-1000
+CP=patrickamadeus/momh-2k1img-step-nopack-600
 
 
 python evaluation.py \
