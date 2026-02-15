@@ -116,6 +116,31 @@ python train.py --dualtower --left_tower_mask_mode full
 ```
 `visual_only` masks left tower to visual-structure tokens only (default), `visual_plus_prefix` also includes tokens before the first visual token in each packed segment, and `full` uses the full attention mask.
 
+### DualTower KV Bridge (All Layers)
+
+DualTower supports an all-layer learnable KV bridge that transforms left-tower K/V before right-tower dual-prefill replacement.
+
+Bridge-only training (freeze full left/right towers, train bridge only):
+```bash
+source .venv/bin/activate && python train.py \
+  --dualtower \
+  --enable_kv_bridge \
+  --dualtower_bridge_only \
+  --lr_kv_bridge 1e-4
+```
+
+Main bridge knobs (recommended start: linear residual):
+- `--enable_kv_bridge`
+- `--kv_bridge_type linear|mlp`
+- `--kv_bridge_mlp_ratio <float>`
+- `--kv_bridge_no_rmsnorm`
+- `--kv_bridge_no_residual`
+- `--lr_kv_bridge <float>`
+- `--dualtower_bridge_only`
+- `--left_tower_prefill_no_grad`
+
+Ablation commands and knob reference: `DUALTOWER_KV_BRIDGE_ABLATIONS.md`.
+
 `train.py` computes loss with `loss_reduction="sum"` and normalizes updates/metrics by the number of valid target tokens (`labels != -100`) across gradient accumulation (and across all ranks in DDP).
 When logging, `train/batch_loss` is the current microbatch token-normalized loss, and `train/step_loss` is the token-normalized loss used for the optimizer step.
 It also logs `effective_token_ratio_per_instance = mean_i(valid_target_tokens_i / attention_tokens_i)` for training.

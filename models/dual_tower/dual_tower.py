@@ -36,6 +36,7 @@ class LeftTower(VisionLanguageModel):
             for p in self.decoder.parameters():
                 p.requires_grad = False
 
+
     def forward(
         self, 
         input_ids: torch.Tensor, 
@@ -70,6 +71,116 @@ class RightTower(LanguageModel):
                 p.requires_grad = False
 
 
+class HeadDimRMSNorm(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(dim))
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        inv_rms = torch.rsqrt(torch.mean(x.pow(2), dim=-1, keepdim=True) + self.eps)
+        return x * inv_rms * self.weight
+
+
+class KVBridgeLayer(nn.Module):
+    def __init__(
+        self,
+        head_dim: int,
+        *,
+        bridge_type: str,
+        mlp_ratio: float,
+        use_rmsnorm: bool,
+        residual: bool,
+    ):
+        super().__init__()
+        self.bridge_type = bridge_type
+        self.residual = residual
+        self.norm_k = HeadDimRMSNorm(head_dim) if use_rmsnorm else nn.Identity()
+        self.norm_v = HeadDimRMSNorm(head_dim) if use_rmsnorm else nn.Identity()
+
+        if bridge_type == "linear":
+            self.k_proj = nn.Linear(head_dim, head_dim, bias=False)
+            self.v_proj = nn.Linear(head_dim, head_dim, bias=False)
+            if residual:
+                nn.init.zeros_(self.k_proj.weight)
+                nn.init.zeros_(self.v_proj.weight)
+            else:
+                nn.init.eye_(self.k_proj.weight)
+                nn.init.eye_(self.v_proj.weight)
+        elif bridge_type == "mlp":
+            hidden_dim = max(1, int(round(head_dim * mlp_ratio)))
+            self.k_fc1 = nn.Linear(head_dim, hidden_dim, bias=False)
+            self.k_fc2 = nn.Linear(hidden_dim, head_dim, bias=False)
+            self.v_fc1 = nn.Linear(head_dim, hidden_dim, bias=False)
+            self.v_fc2 = nn.Linear(hidden_dim, head_dim, bias=False)
+            if residual:
+                # Near-identity start with non-zero gradient flow through residual MLP branch.
+                nn.init.normal_(self.k_fc2.weight, mean=0.0, std=1e-4)
+                nn.init.normal_(self.v_fc2.weight, mean=0.0, std=1e-4)
+        else:
+            raise ValueError(f"Unsupported kv_bridge_type={bridge_type!r}. Expected one of ['linear', 'mlp']")
+
+    def _project(self, x: torch.Tensor, is_key: bool) -> torch.Tensor:
+        if self.bridge_type == "linear":
+            return self.k_proj(x) if is_key else self.v_proj(x)
+
+        if is_key:
+            return self.k_fc2(F.silu(self.k_fc1(x)))
+        return self.v_fc2(F.silu(self.v_fc1(x)))
+
+    def forward(self, k: torch.Tensor, v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        k_in = self.norm_k(k)
+        v_in = self.norm_v(v)
+
+        k_out = self._project(k_in, is_key=True)
+        v_out = self._project(v_in, is_key=False)
+
+        if self.residual:
+            return k + k_out, v + v_out
+        return k_out, v_out
+
+
+class KVCacheBridge(nn.Module):
+    def __init__(self, cfg: VLMConfig):
+        super().__init__()
+        bridge_type = getattr(cfg, "kv_bridge_type", "linear")
+        if bridge_type not in {"linear", "mlp"}:
+            raise ValueError(f"Unsupported kv_bridge_type={bridge_type!r}. Expected one of ['linear', 'mlp']")
+
+        head_dim = cfg.lm_hidden_dim // cfg.lm_n_heads
+        self.layers = nn.ModuleList([
+            KVBridgeLayer(
+                head_dim,
+                bridge_type=bridge_type,
+                mlp_ratio=getattr(cfg, "kv_bridge_mlp_ratio", 2.0),
+                use_rmsnorm=getattr(cfg, "kv_bridge_use_rmsnorm", True),
+                residual=getattr(cfg, "kv_bridge_residual", True),
+            )
+            for _ in range(cfg.lm_n_blocks)
+        ])
+
+    def forward(self, kv_cache: list[dict]) -> list[dict]:
+        if len(kv_cache) != len(self.layers):
+            raise ValueError(
+                f"KV bridge expected {len(self.layers)} layers, got {len(kv_cache)}."
+            )
+
+        for layer_idx, (bridge_layer, layer_cache) in enumerate(zip(self.layers, kv_cache)):
+            if layer_cache is None:
+                raise ValueError(f"KV bridge expected cache dict at layer {layer_idx}, got None.")
+
+            key = layer_cache.get("key")
+            value = layer_cache.get("value")
+            if key is None or value is None:
+                raise ValueError(f"KV bridge expected 'key' and 'value' at layer {layer_idx}.")
+
+            bridged_key, bridged_value = bridge_layer(key, value)
+            layer_cache["key"] = bridged_key
+            layer_cache["value"] = bridged_value
+
+        return kv_cache
+
+
 class DualTowerVLM(nn.Module):
     def __init__(
         self,
@@ -96,12 +207,14 @@ class DualTowerVLM(nn.Module):
             freeze_decoder=freeze_right_decoder,
         )
         self.left_tower_mask_mode = getattr(cfg, "left_tower_mask_mode", "visual_only")
+        self.left_tower_prefill_no_grad = bool(getattr(cfg, "left_tower_prefill_no_grad", False))
         valid_modes = {"visual_only", "visual_plus_prefix", "full"}
         if self.left_tower_mask_mode not in valid_modes:
             raise ValueError(
                 f"Unsupported left_tower_mask_mode={self.left_tower_mask_mode!r}. "
                 f"Expected one of {sorted(valid_modes)}."
             )
+        self.kv_bridge = KVCacheBridge(cfg) if getattr(cfg, "kv_bridge_enabled", False) else None
         self.tokenizer = self.left_tower.tokenizer
         self._kv_replace_token_ids = self._collect_kv_replace_token_ids()
 
@@ -127,6 +240,9 @@ class DualTowerVLM(nn.Module):
     def _annotate_left_kv_cache(self, kv_cache: list[dict], input_ids: torch.Tensor, attention_mask: torch.Tensor = None):
         # Right tower uses this mask to keep left-tower K/V on visual marker token positions.
         # This includes <|image|>, <|global_image|>, and row/col locator tokens.
+        if self.kv_bridge is not None:
+            kv_cache = self.kv_bridge(kv_cache)
+
         img_mask = self._build_visual_token_mask(input_ids, attention_mask)
         for layer_cache in kv_cache:
             layer_cache["img_mask"] = img_mask
@@ -191,6 +307,35 @@ class DualTowerVLM(nn.Module):
 
         return (visual_mask | prefix_mask).to(dtype=torch.long)
 
+
+
+    def _run_left_tower_prefill(
+        self,
+        input_ids: torch.Tensor,
+        images,
+        left_attention_mask: torch.Tensor,
+    ) -> list[dict]:
+        if self.left_tower_prefill_no_grad:
+            if self.training and any(p.requires_grad for p in self.left_tower.parameters()):
+                raise ValueError(
+                    "left_tower_prefill_no_grad=True cannot be used when left tower is trainable. "
+                    "Freeze left tower params or disable left_tower_prefill_no_grad."
+                )
+            with torch.no_grad():
+                _, kv_cache = self.left_tower(
+                    input_ids=input_ids,
+                    images=images,
+                    attention_mask=left_attention_mask,
+                )
+            return kv_cache
+
+        _, kv_cache = self.left_tower(
+            input_ids=input_ids,
+            images=images,
+            attention_mask=left_attention_mask,
+        )
+        return kv_cache
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -202,10 +347,10 @@ class DualTowerVLM(nn.Module):
     ):
         left_attention_mask = self._build_left_tower_attention_mask(input_ids, attention_mask)
         # Process the full sequence through left tower, then reuse its image-token K/V in right tower.
-        _, kv_cache = self.left_tower(
+        kv_cache = self._run_left_tower_prefill(
             input_ids=input_ids,
             images=images,
-            attention_mask=left_attention_mask,
+            left_attention_mask=left_attention_mask,
         )
         kv_cache = self._annotate_left_kv_cache(kv_cache, input_ids, attention_mask)
 
@@ -284,10 +429,10 @@ class DualTowerVLM(nn.Module):
         left_attention_mask = self._build_left_tower_attention_mask(input_ids, attention_mask)
         
         # Process left tower to get image KV cache
-        _, kv_cache = self.left_tower(
+        kv_cache = self._run_left_tower_prefill(
             input_ids=input_ids,
             images=images,
-            attention_mask=left_attention_mask,
+            left_attention_mask=left_attention_mask,
         )
         kv_cache = self._annotate_left_kv_cache(kv_cache, input_ids, attention_mask)
         

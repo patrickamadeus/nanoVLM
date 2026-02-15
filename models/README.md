@@ -29,3 +29,5 @@ Dual-tower architecture is available under `models/dual_tower/`:
 - the right tower now reuses the shared `models/language_model.py` implementation with a minimal dual-prefill KV override hook in attention.
 - left tower prefill mask is configurable via `cfg.left_tower_mask_mode`:
   `visual_only` (default), `visual_plus_prefix`, or `full`.
+- optional all-layer KV bridge (`cfg.kv_bridge_enabled`) transforms left-tower K/V before right-tower dual-prefill replacement.
+  bridge knobs: `kv_bridge_type`, `kv_bridge_mlp_ratio`, `kv_bridge_use_rmsnorm`, `kv_bridge_residual`.

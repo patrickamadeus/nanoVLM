@@ -40,37 +40,39 @@ class TestVisionLanguageModel(unittest.TestCase):
         self.model = VisionLanguageModel(self.cfg, load_backbone=False) # Don't load pretrained for unit test
         self.model.eval() # Set model to evaluation mode
 
-    def test_generate_kv_caching_consistency(self):
+    def test_generate_greedy_determinism_and_shape(self):
         batch_size = 16
         prompt_seq_len = 32
-        max_new_tokens = 16 # Generate a few tokens
+        max_new_tokens = 16  # Generate a few tokens
 
-        # Dummy image (Batch, Channels, Height, Width)
-        image_input = torch.randn(batch_size, 3, self.cfg.vit_img_size, self.cfg.vit_img_size)
         # Dummy prompt input_ids
         prompt_ids = torch.randint(0, self.cfg.lm_vocab_size, (batch_size, prompt_seq_len))
 
-        # Generation with KV caching (default)
-        generated_ids_with_cache = self.model.generate(
+        # The model now always uses KV cache internally.
+        # Verify generation is deterministic under greedy decoding and has expected shape.
+        generated_ids_first = self.model.generate(
             prompt_ids,
-            image_input,
+            None,
             max_new_tokens=max_new_tokens,
-            use_kv_cache=True,
-            greedy=True # Use greedy for deterministic output
+            greedy=True,
         )
 
-        # Generation without KV caching
-        generated_ids_without_cache = self.model.generate(
+        generated_ids_second = self.model.generate(
             prompt_ids,
-            image_input,
+            None,
             max_new_tokens=max_new_tokens,
-            use_kv_cache=False,
-            greedy=True # Use greedy for deterministic output
+            greedy=True,
         )
-        
+
+        self.assertEqual(
+            tuple(generated_ids_first.shape),
+            (batch_size, max_new_tokens),
+            f"Unexpected generated shape: {tuple(generated_ids_first.shape)}",
+        )
+
         self.assertTrue(
-            torch.equal(generated_ids_with_cache, generated_ids_without_cache),
-            f"Generated token IDs with and without KV caching do not match.\nWith cache: {generated_ids_with_cache}\nWithout cache: {generated_ids_without_cache}"
+            torch.equal(generated_ids_first, generated_ids_second),
+            "Greedy generation is not deterministic across repeated runs with identical inputs.",
         )
 
 if __name__ == '__main__':

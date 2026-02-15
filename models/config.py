@@ -53,16 +53,24 @@ class VLMConfig:
     vlm_checkpoint_path: str = 'lusxvr/nanoVLM-230M-8k'
     hf_repo_name: str = 'nanoVLM'
     left_tower_mask_mode: str = "visual_only"  # DualTower left-tower masking: visual_only | visual_plus_prefix | full
+    left_tower_prefill_no_grad: bool = False  # If True, compute left-tower KV prefill under torch.no_grad().
+    kv_bridge_enabled: bool = True
+    kv_bridge_type: str = "linear"  # linear | mlp
+    kv_bridge_mlp_ratio: float = 2.0
+    kv_bridge_use_rmsnorm: bool = True
+    kv_bridge_residual: bool = True
 
 
 @dataclass
 class TrainConfig:
-    lr_mp: float = 5e-5
+    lr_mp: float = 0
     lr_vision_backbone: float = 0 #0.0005 #
-    lr_language_backbone: float = 1e-5 #0
+    lr_language_backbone: float = 0 #0
     # DualTower-specific explicit LR controls. If None, falls back to lr_language_backbone.
     lr_left_tower: float | None = None
     lr_right_tower: float | None = 0.0
+    lr_kv_bridge: float | None = 1e-4
+    dualtower_bridge_only: bool = True
     val_size: int = 50000  # Deprecated when using explicit train/val splits.
     batch_size: int = 16
     gradient_accumulation_steps: int = 8
@@ -94,6 +102,6 @@ class TrainConfig:
     lmms_eval_limit: float = None
     lmms_eval_batch_size: int = 64
     push_checkpoints_to_hub: bool = True
-    checkpoint_repo_pattern: str = "patrickamadeus/nanovlm-step-{i}"
+    checkpoint_repo_pattern: str = "patrickamadeus/dualbridge-step-{i}"
     hf_private: bool = False
     push_final_model_to_hub: bool = False

@@ -136,6 +136,13 @@ def get_optimizer_lrs(optimizer, train_cfg):
         param_group_idx += 1
     if train_cfg.lr_language_backbone > 0:
         lrs["lr_language_backbone"] = optimizer.param_groups[param_group_idx]["lr"]
+        param_group_idx += 1
+    if (
+        train_cfg.lr_kv_bridge is not None
+        and train_cfg.lr_kv_bridge > 0
+        and param_group_idx < len(optimizer.param_groups)
+    ):
+        lrs["lr_kv_bridge"] = optimizer.param_groups[param_group_idx]["lr"]
     return lrs
 
 def _combine_split_datasets(datasets_to_combine, stream_dataset):
@@ -515,11 +522,7 @@ def train(train_cfg, vlm_cfg, model_mode: str = "nanovlm"):
     
     if is_master():
         model_label = "DualTowerVLM" if model_mode == "dualtower" else "nanoVLM"
-        total_params = sum(p.numel() for p in model.parameters())
-        log_info(
-            f"{ctext(model_label, 'cyan', attrs=('bold',))} initialized with "
-            f"{ctext(f'{total_params:,}', 'cyan', attrs=('bold',))} parameters"
-        )
+        log_info(f"{ctext(model_label, 'cyan', attrs=('bold',))} initialized")
         log_info(
             f"Training summary{' (global)' if is_dist() else ''}: "
             f"batch size {ctext(int(train_cfg.batch_size*get_world_size()*train_cfg.gradient_accumulation_steps), 'cyan', attrs=('bold',))}"
@@ -549,40 +552,96 @@ def train(train_cfg, vlm_cfg, model_mode: str = "nanovlm"):
         if train_cfg.lr_right_tower is not None
         else train_cfg.lr_language_backbone
     )
+    kv_bridge_lr = (
+        train_cfg.lr_kv_bridge
+        if train_cfg.lr_kv_bridge is not None
+        else train_cfg.lr_language_backbone
+    )
 
     mp_module = model.left_tower.MP if model_mode == "dualtower" and hasattr(model, "left_tower") else model.MP
     vision_module = model.left_tower.vision_encoder if model_mode == "dualtower" and hasattr(model, "left_tower") else model.vision_encoder
 
-    if train_cfg.lr_mp > 0:
-        param_groups.append({'name': 'lr_mp', 'params': list(mp_module.parameters()), 'lr': train_cfg.lr_mp})
-    else:
-        for p in list(mp_module.parameters()):
-            p.requires_grad = False
-
-    if train_cfg.lr_vision_backbone > 0:
-        param_groups.append({'name': 'lr_vision_backbone', 'params': list(vision_module.parameters()), 'lr': train_cfg.lr_vision_backbone})
-    else:
-        for p in list(vision_module.parameters()):
-            p.requires_grad = False
-
     if model_mode == "dualtower" and hasattr(model, "left_tower") and hasattr(model, "right_tower"):
-        if dual_left_lr > 0:
-            param_groups.append({'name': 'lr_left_tower', 'params': list(model.left_tower.decoder.parameters()), 'lr': dual_left_lr})
+        kv_bridge_module = getattr(model, "kv_bridge", None)
+
+        if train_cfg.dualtower_bridge_only:
+            if kv_bridge_module is None:
+                raise ValueError("dualtower_bridge_only=True requires kv_bridge_enabled=True.")
+            if kv_bridge_lr is None or kv_bridge_lr <= 0:
+                raise ValueError("dualtower_bridge_only=True requires lr_kv_bridge > 0.")
+
+            for module in (
+                model.left_tower.vision_encoder,
+                model.left_tower.MP,
+                model.left_tower.decoder,
+                model.right_tower,
+            ):
+                for p in module.parameters():
+                    p.requires_grad = False
+
+            param_groups.append({'name': 'lr_kv_bridge', 'params': list(kv_bridge_module.parameters()), 'lr': kv_bridge_lr})
         else:
-            for p in list(model.left_tower.decoder.parameters()):
+            if train_cfg.lr_mp > 0:
+                param_groups.append({'name': 'lr_mp', 'params': list(mp_module.parameters()), 'lr': train_cfg.lr_mp})
+            else:
+                for p in list(mp_module.parameters()):
+                    p.requires_grad = False
+
+            if train_cfg.lr_vision_backbone > 0:
+                param_groups.append({'name': 'lr_vision_backbone', 'params': list(vision_module.parameters()), 'lr': train_cfg.lr_vision_backbone})
+            else:
+                for p in list(vision_module.parameters()):
+                    p.requires_grad = False
+
+            if dual_left_lr > 0:
+                param_groups.append({'name': 'lr_left_tower', 'params': list(model.left_tower.decoder.parameters()), 'lr': dual_left_lr})
+            else:
+                for p in list(model.left_tower.decoder.parameters()):
+                    p.requires_grad = False
+
+            if dual_right_lr > 0:
+                param_groups.append({'name': 'lr_right_tower', 'params': list(model.right_tower.parameters()), 'lr': dual_right_lr})
+            else:
+                for p in list(model.right_tower.parameters()):
+                    p.requires_grad = False
+
+            if kv_bridge_module is not None:
+                if kv_bridge_lr is not None and kv_bridge_lr > 0:
+                    param_groups.append({'name': 'lr_kv_bridge', 'params': list(kv_bridge_module.parameters()), 'lr': kv_bridge_lr})
+                else:
+                    for p in list(kv_bridge_module.parameters()):
+                        p.requires_grad = False
+    else:
+        if train_cfg.lr_mp > 0:
+            param_groups.append({'name': 'lr_mp', 'params': list(mp_module.parameters()), 'lr': train_cfg.lr_mp})
+        else:
+            for p in list(mp_module.parameters()):
                 p.requires_grad = False
 
-        if dual_right_lr > 0:
-            param_groups.append({'name': 'lr_right_tower', 'params': list(model.right_tower.parameters()), 'lr': dual_right_lr})
+        if train_cfg.lr_vision_backbone > 0:
+            param_groups.append({'name': 'lr_vision_backbone', 'params': list(vision_module.parameters()), 'lr': train_cfg.lr_vision_backbone})
         else:
-            for p in list(model.right_tower.parameters()):
+            for p in list(vision_module.parameters()):
                 p.requires_grad = False
-    else:
+
         if train_cfg.lr_language_backbone > 0:
             param_groups.append({'name': 'lr_language_backbone', 'params': list(model.decoder.parameters()), 'lr': train_cfg.lr_language_backbone})
         else:
             for p in list(model.decoder.parameters()):
                 p.requires_grad = False
+
+    if not param_groups:
+        raise ValueError("No trainable parameter groups configured. Check LR settings and freeze knobs.")
+
+    if is_master():
+        total_params = sum(p.numel() for p in model.parameters())
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        trainable_ratio = (100.0 * trainable_params / max(total_params, 1))
+        log_info(f"Total parameters: {ctext(f'{total_params:,}', 'cyan', attrs=('bold',))}")
+        log_info(
+            f"Trainable parameters: {ctext(f'{trainable_params:,}', 'cyan', attrs=('bold',))} "
+            f"({trainable_ratio:.2f}%)"
+        )
 
     optimizer = optim.AdamW(param_groups)
     all_params = [p for group in optimizer.param_groups for p in group['params']]
@@ -753,6 +812,12 @@ def train(train_cfg, vlm_cfg, model_mode: str = "nanovlm"):
                             if train_cfg.lr_right_tower is not None
                             else train_cfg.lr_language_backbone
                         )
+                    elif group_name == "lr_kv_bridge":
+                        max_lr = (
+                            train_cfg.lr_kv_bridge
+                            if train_cfg.lr_kv_bridge is not None
+                            else train_cfg.lr_language_backbone
+                        )
 
                     if max_lr is not None and max_lr > 0:
                         group['lr'] = get_lr(step_after_update, max_lr, train_cfg.max_training_steps)
@@ -806,7 +871,7 @@ def train(train_cfg, vlm_cfg, model_mode: str = "nanovlm"):
                     should_log_val_decode = (step_after_update % VAL_DEBUG_SAMPLE_INTERVAL == 0)
                     logged_val_decode = False
                     for batch in synchronized_dataloader_step(iter_val_loader, is_dist()):
-                        if val_batches > 1000:
+                        if val_batches > 64:
                             log_info(f"Evaluated {ctext(val_batches, 'cyan', attrs=('bold',))} validation batches")
                             break
                         images = batch["images"]
@@ -954,6 +1019,7 @@ def train(train_cfg, vlm_cfg, model_mode: str = "nanovlm"):
                         f"lr_lm={stats.get('lr_language_backbone', 0.0):.6g} "
                         f"lr_left={stats.get('lr_left_tower', 0.0):.6g} "
                         f"lr_right={stats.get('lr_right_tower', 0.0):.6g} "
+                        f"lr_bridge={stats.get('lr_kv_bridge', 0.0):.6g} "
                         + (f"grad_norm={stats['grad_norm']:.4f}" if 'grad_norm' in stats else "")
                     )
                 
@@ -1078,6 +1144,7 @@ def main():
     parser.add_argument('--lr_language_backbone', type=float, help='Learning rate for the language backbone')
     parser.add_argument('--lr_left_tower', type=float, help='DualTower: learning rate for the left tower language decoder')
     parser.add_argument('--lr_right_tower', type=float, help='DualTower: learning rate for the right tower')
+    parser.add_argument('--lr_kv_bridge', type=float, help='DualTower: learning rate for KV bridge module')
     parser.add_argument('--vlm_checkpoint_path', type=str, help='Path or repo ID of the VLM checkpoint for loading')
     parser.add_argument(
         '--left_tower_mask_mode',
@@ -1085,6 +1152,13 @@ def main():
         choices=['visual_only', 'visual_plus_prefix', 'full'],
         help='DualTower left-tower mask mode: visual_only, visual_plus_prefix, or full',
     )
+    parser.add_argument('--enable_kv_bridge', action='store_true', help='DualTower: enable learnable KV bridge on all layers')
+    parser.add_argument('--kv_bridge_type', type=str, choices=['linear', 'mlp'], help='DualTower KV bridge architecture')
+    parser.add_argument('--kv_bridge_mlp_ratio', type=float, help='DualTower KV bridge MLP hidden ratio')
+    parser.add_argument('--kv_bridge_no_rmsnorm', action='store_true', help='Disable KV bridge RMSNorm pre-normalization')
+    parser.add_argument('--kv_bridge_no_residual', action='store_true', help='Disable KV bridge residual connection')
+    parser.add_argument('--dualtower_bridge_only', action='store_true', help='Freeze left/right towers and train only KV bridge')
+    parser.add_argument('--left_tower_prefill_no_grad', action='store_true', help='DualTower: run left-tower KV prefill under torch.no_grad() to reduce memory')
     parser.add_argument('--compile', type=bool, help='Use torch.compile to optimize the model')
     parser.add_argument('--log_wandb', type=bool, help='Log to wandb')
     parser.add_argument('--resume_from_vlm_checkpoint', type=bool, default=False, help='Resume training from VLM checkpoint specified by vlm_checkpoint_path (or default if not provided)')
@@ -1124,10 +1198,26 @@ def main():
         train_cfg.lr_left_tower = args.lr_left_tower
     if args.lr_right_tower is not None:
         train_cfg.lr_right_tower = args.lr_right_tower
+    if args.lr_kv_bridge is not None:
+        train_cfg.lr_kv_bridge = args.lr_kv_bridge
     if args.vlm_checkpoint_path is not None:
         vlm_cfg.vlm_checkpoint_path = args.vlm_checkpoint_path
     if args.left_tower_mask_mode is not None:
         vlm_cfg.left_tower_mask_mode = args.left_tower_mask_mode
+    if args.enable_kv_bridge:
+        vlm_cfg.kv_bridge_enabled = True
+    if args.kv_bridge_type is not None:
+        vlm_cfg.kv_bridge_type = args.kv_bridge_type
+    if args.kv_bridge_mlp_ratio is not None:
+        vlm_cfg.kv_bridge_mlp_ratio = args.kv_bridge_mlp_ratio
+    if args.kv_bridge_no_rmsnorm:
+        vlm_cfg.kv_bridge_use_rmsnorm = False
+    if args.kv_bridge_no_residual:
+        vlm_cfg.kv_bridge_residual = False
+    if args.dualtower_bridge_only:
+        train_cfg.dualtower_bridge_only = True
+    if args.left_tower_prefill_no_grad:
+        vlm_cfg.left_tower_prefill_no_grad = True
     if args.compile is not None:
         train_cfg.compile = args.compile
     if args.log_wandb is not None:
@@ -1164,6 +1254,11 @@ def main():
     model_mode = "dualtower" if args.dualtower else "nanovlm"
     if args.nanovlm:
         model_mode = "nanovlm"
+
+    if train_cfg.dualtower_bridge_only and model_mode != "dualtower":
+        raise ValueError("--dualtower_bridge_only requires --dualtower mode.")
+    if train_cfg.dualtower_bridge_only:
+        vlm_cfg.left_tower_prefill_no_grad = True
 
     if args.resume_from_vlm_checkpoint and args.vlm_checkpoint_path is not None:
         train_cfg.resume_from_vlm_checkpoint = True
