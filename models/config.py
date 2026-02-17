@@ -14,19 +14,20 @@ class VLMConfig:
     vit_cls_flag: bool = False
     vit_model_type: str = 'google/siglip2-base-patch16-512'
 
-    lm_hidden_dim: int = 960
-    lm_inter_dim: int = 2560
+    lm_hidden_dim: int = 576
+    lm_inter_dim: int = 1536
     lm_rms_eps: float = 1e-5
     lm_re_base: int = 100000
     lm_max_position_embeddings: int = 2048
     lm_base_vocab_size: int = 49152
     extra_token_amount: int = 66  # Number of extra tokens for the VLM (image start, image end, image token)
     lm_vocab_size: int = lm_base_vocab_size + extra_token_amount # Not a great way to do this, but it works for now (vlm_extra_tokens cannot be a dict, since this is mutable, and a Field has no len() function)
-    lm_n_heads: int = 15
-    lm_n_kv_heads: int = 5
+    lm_n_heads: int = 9
+    lm_n_kv_heads: int = 3
     lm_dropout: float = 0.0
-    lm_n_blocks: int = 32
+    lm_n_blocks: int = 30
     lm_attn_scaling: float = 1.0
+    lm_pad_aware_rope: bool = False
     lm_max_length: int = 2048
     lm_use_tokens: bool = False # Decide if the LM expects tokens or embeddings as input (if using as a backbone for the VLM, set to False)
     lm_tie_weights: bool = True # Decide if you want to tie the LM Head weight to the token embedding weights
@@ -52,39 +53,40 @@ class VLMConfig:
     vlm_load_backbone_weights: bool = True
     vlm_checkpoint_path: str = 'lusxvr/nanoVLM-230M-8k'
     hf_repo_name: str = 'nanoVLM'
-    left_tower_mask_mode: str = "visual_only"  # DualTower left-tower masking: visual_only | visual_plus_prefix | full
-    left_tower_prefill_no_grad: bool = False  # If True, compute left-tower KV prefill under torch.no_grad().
-    kv_bridge_enabled: bool = True
-    kv_bridge_type: str = "linear"  # linear | mlp
-    kv_bridge_mlp_ratio: float = 2.0
+    left_mask_scope: str = "full"  # visual_only | visual_sys | full
+    right_prefill_mode: str = "full"  # full | non_donor_only (generation only)
+    use_kv_bridge: bool = True
+    kv_bridge_type: str = "mlp"  # linear | mlp
+    kv_bridge_mlp_ratio: float = 4.0
     kv_bridge_use_rmsnorm: bool = True
     kv_bridge_residual: bool = True
+    kv_bridge_init_mode: str = "default"  # default | normal | diag_eye
 
 
 @dataclass
 class TrainConfig:
-    lr_mp: float = 0
+    lr_mp: float = 5e-5
     lr_vision_backbone: float = 0 #0.0005 #
-    lr_language_backbone: float = 0 #0
+    lr_language_backbone: float = 1e-5 #0
     # DualTower-specific explicit LR controls. If None, falls back to lr_language_backbone.
     lr_left_tower: float | None = None
     lr_right_tower: float | None = 0.0
     lr_kv_bridge: float | None = 1e-4
-    dualtower_bridge_only: bool = True
     val_size: int = 50000  # Deprecated when using explicit train/val splits.
-    batch_size: int = 16
-    gradient_accumulation_steps: int = 8
+    batch_size: int = 8
+    gradient_accumulation_steps: int = 16
     max_grad_norm: float = 1.0
-    eval_in_epochs: bool = True
+    eval_in_epochs: bool = False
     eval_interval: int = 500
-    checkpoint_interval: int = 500
+    checkpoint_interval: int = 200
     stats_log_interval: int = 100
     max_training_steps: int = 20_000
+    warmup_ratio: float = 0.03
     max_images_per_example: int = 1
     max_images_per_knapsack: int = 18
     max_sample_length: int = 2048
     use_packing: bool = True
-    compile: bool = False
+    compile: bool = True
     resume_from_vlm_checkpoint: bool = True # Continue training from a full VLM checkpoint.
     train_dataset_path: str = 'patrickamadeus/the_cauldron'
     train_dataset_name: tuple[str, ...] = ("all", ) #('allava_laion', 'allava_vflan', 'cambrian(filtered)_processed', 'LLaVA_Instruct_150K', 'mmevol', 'sharegpt4o', 'sharegpt4v(coco)', 'sharegpt4v(knowledge)', 'sharegpt4v(llava)', 'sharegpt4v(sam)') # 'vision_flan(filtered)', 'lvis_instruct4v',
@@ -98,10 +100,11 @@ class TrainConfig:
     wandb_entity: str = "HuggingFace" # Indicate the entity to log to in wandb
     log_wandb: bool = True
     use_lmms_eval: bool = False # Disabled for hub-only checkpoint workflow.
-    lmms_eval_tasks: str = 'mmstar,mmmu_val,ocrbench,textvqa_val,docvqa_val,scienceqa,mme,infovqa_val,chartqa' # Pass additional task as one string, seperated by commas without spaces (e.g. 'mmstar,mmmu,ocrbench')
-    lmms_eval_limit: float = None
+    lmms_eval_tasks: str = 'mmstar' # Pass additional task as one string, seperated by commas without spaces (e.g. 'mmstar,mmmu,ocrbench')
+    lmms_eval_limit: float = 100
     lmms_eval_batch_size: int = 64
     push_checkpoints_to_hub: bool = True
-    checkpoint_repo_pattern: str = "patrickamadeus/dualbridge-step-{i}"
+    save_training_state_to_hub: bool = True
+    checkpoint_repo_pattern: str = "patrickamadeus/dualtower-full-step-{i}"
     hf_private: bool = False
     push_final_model_to_hub: bool = False

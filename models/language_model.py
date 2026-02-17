@@ -67,9 +67,10 @@ class RotaryEmbedding(nn.Module):
         self.register_buffer("inv_freq", inv_freq)
         self.original_max_seq_len = cfg.lm_max_position_embeddings
         self.attention_scaling = cfg.lm_attn_scaling
+        self.pad_aware = bool(getattr(cfg, "lm_pad_aware_rope", False))
 
     @torch.no_grad()
-    def forward(self, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, position_ids: torch.Tensor, attention_mask: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Compute rotary positional embeddings (cosine and sine components).
 
@@ -82,6 +83,17 @@ class RotaryEmbedding(nn.Module):
         """
 
         batch_size, seq_len = position_ids.shape
+
+        # Optional pad-aware RoPE (legacy-compatible): remap positions so pad tokens do not
+        # advance position indices within each sample.
+        if self.pad_aware and attention_mask is not None:
+            if attention_mask.shape != position_ids.shape:
+                raise ValueError(
+                    "Pad-aware RoPE requires attention_mask to match position_ids shape. "
+                    f"Got attention_mask={tuple(attention_mask.shape)}, position_ids={tuple(position_ids.shape)}."
+                )
+            position_ids = attention_mask.to(torch.long).cumsum(dim=1) - 1
+            position_ids = position_ids.masked_fill(attention_mask == 0, 0)
         # Dynamic scaling for longer sequences
         # Divide the angle frequency to fit more rotation into the embedding space.
         max_seq = position_ids.max() + 1
@@ -107,6 +119,11 @@ class RotaryEmbedding(nn.Module):
         # Compute cos and sin
         cos = torch.cos(emb) * self.attention_scaling
         sin = torch.sin(emb) * self.attention_scaling
+
+        if self.pad_aware and attention_mask is not None:
+            mask_expanded = attention_mask.unsqueeze(-1).expand_as(cos)
+            cos = cos * mask_expanded.float()
+            sin = sin * mask_expanded.float()
         
         return cos, sin
 
@@ -204,6 +221,34 @@ class LanguageModelGroupedQueryAttention(nn.Module):
         if not self.sdpa:
             print("Warning: scaled dot product attention not available, using standard attention in LM.")
 
+    @staticmethod
+    def _build_dual_prefill_attn_mask(
+        replace_mask: torch.Tensor,
+        key_valid_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Build legacy-style dual-prefill attention mask for arbitrary donor spans.
+
+        Semantics:
+        - Donor-query rows attend only donor keys (bidirectional within donor set).
+        - Non-donor rows attend all donor keys.
+        - Non-donor -> non-donor is causal.
+        - Invalid key positions (padding) are masked out.
+        """
+        replace_mask = replace_mask.to(torch.bool)
+        key_valid_mask = key_valid_mask.to(torch.bool)
+        replace_mask = replace_mask & key_valid_mask
+
+        _, T = replace_mask.shape
+        causal = torch.tril(torch.ones(T, T, device=replace_mask.device, dtype=torch.bool)).unsqueeze(0)
+        q_non_donor = (~replace_mask).unsqueeze(2)  # [B, T, 1]
+        k_non_donor = (~replace_mask).unsqueeze(1)  # [B, 1, T]
+        k_donor = replace_mask.unsqueeze(1)         # [B, 1, T]
+
+        attn_mask = k_donor | (q_non_donor & k_non_donor & causal)
+        attn_mask = attn_mask & key_valid_mask.unsqueeze(1)
+        return attn_mask
+
     def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, attention_mask=None, block_kv_cache=None) -> tuple[torch.Tensor, dict]:
         """
         Forward pass for grouped query attention.
@@ -233,6 +278,7 @@ class LanguageModelGroupedQueryAttention(nn.Module):
         # Apply rotary embeddings to the current q and k
         q, k_rotated = apply_rotary_pos_embd(q_curr, k_curr, cos, sin)
 
+        dual_prefill_attn_mask_bool = None
         if block_kv_cache is None:
             # No cache, this is the first pass (prefill)
             k = k_rotated
@@ -241,29 +287,59 @@ class LanguageModelGroupedQueryAttention(nn.Module):
         else:
             k_cached = block_kv_cache.get("key")
             v_cached = block_kv_cache.get("value")
+            query_only = bool(block_kv_cache.get("query_only", False))
             needs_dual_prefill = bool(block_kv_cache.get("needs_dual_prefill", False))
-            img_mask = block_kv_cache.get("img_mask")
+            replace_mask = block_kv_cache.get("replace_mask")
+            if replace_mask is None:
+                # Backward compatibility for older checkpoints/runtime code.
+                replace_mask = block_kv_cache.get("img_mask")
 
             # Optional dual-prefill mode:
             # replace cached K/V only on selected visual-token positions.
-            if needs_dual_prefill:
+            if query_only:
+                if k_cached is None or v_cached is None:
+                    raise ValueError("query_only attention requires existing cached `key` and `value` tensors.")
+                k = k_cached
+                v = v_cached
+                # Keep cache tensors unchanged for subsequent decode append.
+                block_kv_cache["needs_dual_prefill"] = False
+                block_kv_cache.pop("replace_mask", None)
+                block_kv_cache.pop("img_mask", None)
+            elif needs_dual_prefill:
                 if k_cached is None or v_cached is None:
                     raise ValueError("Dual prefill requires existing cached `key` and `value` tensors.")
                 if k_cached.size(2) != T_curr:
                     raise ValueError(
                         f"Dual prefill expects cached length == current length, got cache={k_cached.size(2)}, curr={T_curr}."
                     )
-                if img_mask is None or img_mask.shape != (B, T_curr):
+                if replace_mask is None or replace_mask.shape != (B, T_curr):
                     raise ValueError(
-                        f"Dual prefill `img_mask` shape must be {(B, T_curr)}, got {None if img_mask is None else tuple(img_mask.shape)}."
+                        f"Dual prefill `replace_mask` shape must be {(B, T_curr)}, got {None if replace_mask is None else tuple(replace_mask.shape)}."
                     )
 
-                mask_4d = img_mask.to(device=x.device, dtype=torch.bool).unsqueeze(1).unsqueeze(-1)  # [B,1,T,1]
+                mask_4d = replace_mask.to(device=x.device, dtype=torch.bool).unsqueeze(1).unsqueeze(-1)  # [B,1,T,1]
                 k = torch.where(mask_4d, k_cached, k_rotated)
                 v = torch.where(mask_4d, v_cached, v_curr)
                 block_kv_cache['key'] = k
                 block_kv_cache['value'] = v
+
+                # Restore legacy dual-prefill interaction pattern only for partial donor scope.
+                # If all valid tokens are donor tokens (full scope), keep standard causal semantics.
+                if attention_mask is None:
+                    key_valid_mask = torch.ones((B, T_curr), device=x.device, dtype=torch.bool)
+                else:
+                    key_valid_mask = attention_mask[:, :T_curr].to(torch.bool)
+                replace_mask_bool = replace_mask.to(device=x.device, dtype=torch.bool)
+                replace_all_valid = torch.equal(replace_mask_bool, key_valid_mask)
+                if not replace_all_valid:
+                    dual_prefill_attn_mask_bool = self._build_dual_prefill_attn_mask(
+                        replace_mask=replace_mask_bool,
+                        key_valid_mask=key_valid_mask,
+                    )
+
                 block_kv_cache['needs_dual_prefill'] = False
+                block_kv_cache.pop("replace_mask", None)
+                block_kv_cache.pop("img_mask", None)
             elif k_cached is not None and v_cached is not None:
                 # Standard decode path: append new K/V to cached prefix.
                 k = torch.cat([k_cached, k_rotated], dim=2)
@@ -293,12 +369,25 @@ class LanguageModelGroupedQueryAttention(nn.Module):
             additive_attn_mask = (1.0 - mask_for_keys.unsqueeze(1).unsqueeze(2).float()) * torch.finfo(q.dtype).min
             # This additive_attn_mask shape is [B, 1, 1, T_kv]
 
+        dual_prefill_additive_mask = None
+        if dual_prefill_attn_mask_bool is not None:
+            dual_prefill_additive_mask = (
+                (~dual_prefill_attn_mask_bool).unsqueeze(1).to(q.dtype) * torch.finfo(q.dtype).min
+            )
+        combined_attn_mask = additive_attn_mask
+        if dual_prefill_additive_mask is not None:
+            combined_attn_mask = (
+                dual_prefill_additive_mask
+                if combined_attn_mask is None
+                else (dual_prefill_additive_mask + combined_attn_mask)
+            )
+
         if self.sdpa and x.device.type != 'mps':
             # During decode, no additional masking needed as [1, T_kv] is naturally causal
-            is_causal = (T_curr == T_kv and T_curr > 1)
+            is_causal = (T_curr == T_kv and T_curr > 1 and dual_prefill_attn_mask_bool is None)
             y = torch.nn.functional.scaled_dot_product_attention(
                 q, k_exp, v_exp,
-                attn_mask=additive_attn_mask, 
+                attn_mask=combined_attn_mask, 
                 dropout_p=self.dropout if self.training else 0.0,
                 is_causal=is_causal
             )
@@ -306,7 +395,9 @@ class LanguageModelGroupedQueryAttention(nn.Module):
             # Manual attention implementation
             attn = torch.matmul(q, k_exp.transpose(2, 3)) / math.sqrt(self.head_dim) # (B, n_heads, T_curr, T_kv)
             # During decode: no additional masking needed as [1, T_kv] is naturally causal
-            if T_curr == T_kv and T_curr > 1:
+            if dual_prefill_attn_mask_bool is not None:
+                attn = attn.masked_fill(~dual_prefill_attn_mask_bool.unsqueeze(1), float('-inf'))
+            elif T_curr == T_kv and T_curr > 1:
                 causal_mask_val = torch.tril(torch.ones(T_curr, T_curr, device=x.device, dtype=torch.bool)).view(1, 1, T_curr, T_curr)
                 attn = attn.masked_fill(~causal_mask_val, float('-inf'))
 
@@ -487,8 +578,27 @@ class LanguageModel(nn.Module):
         B, T_curr, _ = x.size()
         
         # Create position_ids for the current sequence based on start_pos
-        current_position_ids = torch.arange(start_pos, start_pos + T_curr, device=x.device).unsqueeze(0).expand(B, -1)
-        cos, sin = self.rotary_embd(current_position_ids) # Get rotary position embeddings for current tokens
+        if isinstance(start_pos, torch.Tensor):
+            if start_pos.dim() == 0:
+                start_pos = start_pos.unsqueeze(0)
+            if start_pos.dim() == 2:
+                if tuple(start_pos.shape) != (B, T_curr):
+                    raise ValueError(
+                        f"Tensor start_pos as explicit position_ids must match [B,T_curr]. "
+                        f"expected={(B, T_curr)}, got={tuple(start_pos.shape)}"
+                    )
+                current_position_ids = start_pos.to(device=x.device, dtype=torch.long)
+            elif start_pos.dim() == 1:
+                if start_pos.size(0) != B:
+                    raise ValueError(f"Tensor start_pos batch size mismatch. expected B={B}, got {start_pos.size(0)}")
+                offsets = torch.arange(T_curr, device=x.device).unsqueeze(0)
+                current_position_ids = start_pos.to(device=x.device, dtype=torch.long).unsqueeze(1) + offsets
+            else:
+                raise ValueError(f"Tensor start_pos must be 1D [B] or 2D [B,T], got shape {tuple(start_pos.shape)}")
+        else:
+            current_position_ids = torch.arange(start_pos, start_pos + T_curr, device=x.device).unsqueeze(0).expand(B, -1)
+        rope_mask = attention_mask if (attention_mask is not None and attention_mask.size(1) == T_curr) else None
+        cos, sin = self.rotary_embd(current_position_ids, rope_mask) # Get rotary position embeddings for current tokens
 
         # Initialize new KV cache if none provided
         if kv_cache is None:

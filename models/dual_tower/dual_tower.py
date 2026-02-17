@@ -91,10 +91,12 @@ class KVBridgeLayer(nn.Module):
         mlp_ratio: float,
         use_rmsnorm: bool,
         residual: bool,
+        init_mode: str,
     ):
         super().__init__()
         self.bridge_type = bridge_type
         self.residual = residual
+        self.init_mode = init_mode
         self.norm_k = HeadDimRMSNorm(head_dim) if use_rmsnorm else nn.Identity()
         self.norm_v = HeadDimRMSNorm(head_dim) if use_rmsnorm else nn.Identity()
 
@@ -113,12 +115,56 @@ class KVBridgeLayer(nn.Module):
             self.k_fc2 = nn.Linear(hidden_dim, head_dim, bias=False)
             self.v_fc1 = nn.Linear(head_dim, hidden_dim, bias=False)
             self.v_fc2 = nn.Linear(hidden_dim, head_dim, bias=False)
-            if residual:
+        else:
+            raise ValueError(f"Unsupported kv_bridge_type={bridge_type!r}. Expected one of ['linear', 'mlp']")
+
+        self._init_bridge_parameters()
+
+    def _fill_diag_eye(self, weight: torch.Tensor) -> None:
+        weight.zero_()
+        diag_len = min(weight.size(0), weight.size(1))
+        weight[torch.arange(diag_len), torch.arange(diag_len)] = 1.0
+
+    def _init_bridge_parameters(self) -> None:
+        if self.init_mode not in {"default", "normal", "diag_eye"}:
+            raise ValueError(
+                f"Unsupported kv_bridge_init_mode={self.init_mode!r}. "
+                f"Expected one of ['default', 'normal', 'diag_eye']."
+            )
+
+        if self.init_mode == "default":
+            if self.bridge_type == "linear":
+                if self.residual:
+                    nn.init.zeros_(self.k_proj.weight)
+                    nn.init.zeros_(self.v_proj.weight)
+                else:
+                    nn.init.eye_(self.k_proj.weight)
+                    nn.init.eye_(self.v_proj.weight)
+            elif self.residual and self.bridge_type == "mlp":
                 # Near-identity start with non-zero gradient flow through residual MLP branch.
                 nn.init.normal_(self.k_fc2.weight, mean=0.0, std=1e-4)
                 nn.init.normal_(self.v_fc2.weight, mean=0.0, std=1e-4)
-        else:
-            raise ValueError(f"Unsupported kv_bridge_type={bridge_type!r}. Expected one of ['linear', 'mlp']")
+            return
+
+        with torch.no_grad():
+            if self.bridge_type == "linear":
+                if self.init_mode == "normal":
+                    nn.init.normal_(self.k_proj.weight, mean=0.0, std=0.02)
+                    nn.init.normal_(self.v_proj.weight, mean=0.0, std=0.02)
+                else:
+                    self._fill_diag_eye(self.k_proj.weight)
+                    self._fill_diag_eye(self.v_proj.weight)
+            else:
+                if self.init_mode == "normal":
+                    nn.init.normal_(self.k_fc1.weight, mean=0.0, std=0.02)
+                    nn.init.normal_(self.k_fc2.weight, mean=0.0, std=0.02)
+                    nn.init.normal_(self.v_fc1.weight, mean=0.0, std=0.02)
+                    nn.init.normal_(self.v_fc2.weight, mean=0.0, std=0.02)
+                else:
+                    self._fill_diag_eye(self.k_fc1.weight)
+                    self._fill_diag_eye(self.k_fc2.weight)
+                    self._fill_diag_eye(self.v_fc1.weight)
+                    self._fill_diag_eye(self.v_fc2.weight)
 
     def _project(self, x: torch.Tensor, is_key: bool) -> torch.Tensor:
         if self.bridge_type == "linear":
@@ -155,6 +201,7 @@ class KVCacheBridge(nn.Module):
                 mlp_ratio=getattr(cfg, "kv_bridge_mlp_ratio", 2.0),
                 use_rmsnorm=getattr(cfg, "kv_bridge_use_rmsnorm", True),
                 residual=getattr(cfg, "kv_bridge_residual", True),
+                init_mode=getattr(cfg, "kv_bridge_init_mode", "default"),
             )
             for _ in range(cfg.lm_n_blocks)
         ])
@@ -206,17 +253,72 @@ class DualTowerVLM(nn.Module):
             load_backbone=load_backbone,
             freeze_decoder=freeze_right_decoder,
         )
-        self.left_tower_mask_mode = getattr(cfg, "left_tower_mask_mode", "visual_only")
-        self.left_tower_prefill_no_grad = bool(getattr(cfg, "left_tower_prefill_no_grad", False))
-        valid_modes = {"visual_only", "visual_plus_prefix", "full"}
-        if self.left_tower_mask_mode not in valid_modes:
+        self.left_mask_scope = getattr(cfg, "left_mask_scope", "visual_only")
+        valid_modes = {"visual_only", "visual_sys", "full"}
+        if self.left_mask_scope not in valid_modes:
             raise ValueError(
-                f"Unsupported left_tower_mask_mode={self.left_tower_mask_mode!r}. "
+                f"Unsupported left_mask_scope={self.left_mask_scope!r}. "
                 f"Expected one of {sorted(valid_modes)}."
             )
-        self.kv_bridge = KVCacheBridge(cfg) if getattr(cfg, "kv_bridge_enabled", False) else None
+        self.right_prefill_mode = getattr(cfg, "right_prefill_mode", "full")
+        valid_prefill_modes = {"full", "non_donor_only"}
+        if self.right_prefill_mode not in valid_prefill_modes:
+            raise ValueError(
+                f"Unsupported right_prefill_mode={self.right_prefill_mode!r}. "
+                f"Expected one of {sorted(valid_prefill_modes)}."
+            )
+        self.kv_bridge = KVCacheBridge(cfg) if getattr(cfg, "use_kv_bridge", False) else None
         self.tokenizer = self.left_tower.tokenizer
         self._kv_replace_token_ids = self._collect_kv_replace_token_ids()
+
+    @staticmethod
+    def _last_valid_token_indices(attention_mask: torch.Tensor) -> torch.Tensor:
+        if attention_mask.dim() != 2:
+            raise ValueError(f"Expected attention_mask with shape [B, T], got {tuple(attention_mask.shape)}.")
+        valid_counts = attention_mask.to(torch.long).sum(dim=1)
+        if torch.any(valid_counts <= 0):
+            raise ValueError("Each sample must have at least one valid token for generation.")
+        reverse_first_valid = torch.flip(attention_mask.to(torch.long), dims=[1]).argmax(dim=1)
+        return attention_mask.size(1) - 1 - reverse_first_valid
+
+    @staticmethod
+    def _mark_query_only(kv_cache: list[dict]) -> None:
+        for layer_cache in kv_cache:
+            layer_cache["query_only"] = True
+            layer_cache["needs_dual_prefill"] = False
+            layer_cache.pop("replace_mask", None)
+            layer_cache.pop("img_mask", None)
+
+    @staticmethod
+    def _clear_query_only(kv_cache: list[dict]) -> None:
+        for layer_cache in kv_cache:
+            layer_cache.pop("query_only", None)
+
+    def _run_non_donor_only_prefill(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        kv_cache: list[dict],
+    ) -> tuple[torch.Tensor, list[dict]]:
+        self._mark_query_only(kv_cache)
+
+        last_valid_idx = self._last_valid_token_indices(attention_mask)
+        last_token_ids = input_ids.gather(1, last_valid_idx.unsqueeze(1))
+        last_token_embd = self.right_tower.token_embedding(last_token_ids)
+
+        if getattr(self.cfg, "lm_pad_aware_rope", False):
+            bootstrap_start_pos = attention_mask.to(torch.long).sum(dim=1) - 1
+        else:
+            bootstrap_start_pos = last_valid_idx
+
+        bootstrap_output, kv_cache = self.right_tower.forward(
+            x=last_token_embd,
+            attention_mask=attention_mask,
+            kv_cache=kv_cache,
+            start_pos=bootstrap_start_pos,
+        )
+        self._clear_query_only(kv_cache)
+        return bootstrap_output[:, -1, :], kv_cache
 
     def _collect_kv_replace_token_ids(self) -> torch.Tensor:
         """
@@ -238,14 +340,13 @@ class DualTowerVLM(nn.Module):
         return torch.tensor(sorted(token_ids), dtype=torch.long)
 
     def _annotate_left_kv_cache(self, kv_cache: list[dict], input_ids: torch.Tensor, attention_mask: torch.Tensor = None):
-        # Right tower uses this mask to keep left-tower K/V on visual marker token positions.
-        # This includes <|image|>, <|global_image|>, and row/col locator tokens.
+        # Right tower uses this mask to replace K/V from left cache over the configured scope.
         if self.kv_bridge is not None:
             kv_cache = self.kv_bridge(kv_cache)
 
-        img_mask = self._build_visual_token_mask(input_ids, attention_mask)
+        replace_mask = self._build_scope_mask(input_ids, attention_mask)
         for layer_cache in kv_cache:
-            layer_cache["img_mask"] = img_mask
+            layer_cache["replace_mask"] = replace_mask
             layer_cache["needs_dual_prefill"] = True
         return kv_cache
 
@@ -260,30 +361,27 @@ class DualTowerVLM(nn.Module):
             visual_mask = visual_mask & attention_mask.to(torch.bool)
         return visual_mask
 
-    def _build_left_tower_attention_mask(
+    def _build_scope_mask(
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        mode = self.left_tower_mask_mode
+        mode = self.left_mask_scope
 
-        if mode == "full":
-            if attention_mask is None:
-                return torch.ones_like(input_ids, dtype=torch.long)
-            return attention_mask.to(dtype=torch.long)
-
-        visual_mask = self._build_visual_token_mask(input_ids, attention_mask)
-        if mode == "visual_only":
-            # Left tower is constrained to visual structure tokens only.
-            return visual_mask.to(dtype=torch.long)
-
-        # mode == "visual_plus_prefix":
-        # For each contiguous valid segment, include the prefix tokens before the first visual token.
         if attention_mask is None:
             valid_mask = torch.ones_like(input_ids, dtype=torch.bool)
         else:
             valid_mask = attention_mask.to(torch.bool)
 
+        if mode == "full":
+            return valid_mask
+
+        visual_mask = self._build_visual_token_mask(input_ids, attention_mask)
+        if mode == "visual_only":
+            return visual_mask
+
+        # mode == "visual_sys":
+        # For each contiguous valid segment, include the prefix tokens before the first visual token.
         prefix_mask = torch.zeros_like(valid_mask)
         B, T = input_ids.shape
         for b in range(B):
@@ -305,9 +403,14 @@ class DualTowerVLM(nn.Module):
                 if first_visual > start:
                     prefix_mask[b, start:first_visual] = True
 
-        return (visual_mask | prefix_mask).to(dtype=torch.long)
+        return visual_mask | prefix_mask
 
-
+    def _build_left_tower_attention_mask(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return self._build_scope_mask(input_ids, attention_mask).to(dtype=torch.long)
 
     def _run_left_tower_prefill(
         self,
@@ -315,12 +418,8 @@ class DualTowerVLM(nn.Module):
         images,
         left_attention_mask: torch.Tensor,
     ) -> list[dict]:
-        if self.left_tower_prefill_no_grad:
-            if self.training and any(p.requires_grad for p in self.left_tower.parameters()):
-                raise ValueError(
-                    "left_tower_prefill_no_grad=True cannot be used when left tower is trainable. "
-                    "Freeze left tower params or disable left_tower_prefill_no_grad."
-                )
+        # If left tower is frozen, avoid autograd overhead for prefill by default.
+        if not any(p.requires_grad for p in self.left_tower.parameters()):
             with torch.no_grad():
                 _, kv_cache = self.left_tower(
                     input_ids=input_ids,
@@ -436,20 +535,76 @@ class DualTowerVLM(nn.Module):
         )
         kv_cache = self._annotate_left_kv_cache(kv_cache, input_ids, attention_mask)
         
-        # Prefill phase: process the FULL sequence with image KV cache
-        # The right tower will internally handle replacing image K/V with cached values
-        # See modified GQA implementation above for this `LanguageModelGroupedQueryAttention`
+        if self.right_prefill_mode == "full":
+            # Prefill phase: process the FULL sequence with image KV cache.
+            # The right tower will internally handle replacing K/V over the configured scope.
+            full_embd = self.right_tower.token_embedding(input_ids)
+            prompt_output, kv_cache = self.right_tower.forward(
+                x=full_embd,
+                attention_mask=attention_mask,
+                kv_cache=kv_cache,
+                start_pos=0,  # prefill starts at position 0
+            )
+            last_output = prompt_output[:, -1, :]
+        elif self.right_prefill_mode == "non_donor_only":
+            # Scope-aware minimal right-side prefill:
+            # - full: single last-token bootstrap query
+            # - visual_only / visual_sys: query only over non-donor (unprocessed) span
+            if self.left_mask_scope == "full":
+                last_output, kv_cache = self._run_non_donor_only_prefill(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    kv_cache=kv_cache,
+                )
+            else:
+                if B != 1:
+                    raise ValueError(
+                        "right_prefill_mode='non_donor_only' with visual scopes currently supports batch_size=1 only."
+                    )
+                donor_mask = self._build_scope_mask(input_ids, attention_mask).to(torch.bool)
+                valid_mask = attention_mask.to(torch.bool)
+                query_mask = valid_mask & (~donor_mask)
+                last_valid_idx = self._last_valid_token_indices(attention_mask)
 
-        # TODO: below token embedding code is the bypass attempt on self.cfg.lm_use_token, future work may include `if self.cfg.lm_use_tokens` for better conditional in various cases.
-        full_embd = self.right_tower.token_embedding(input_ids)
-        prompt_output, kv_cache = self.right_tower.forward(
-            x=full_embd,
-            attention_mask=attention_mask,
-            kv_cache=kv_cache,
-            start_pos=0  # we start prefill from pos 0
-        )
-        
-        last_output = prompt_output[:, -1, :]
+                # We need a right-query for the final valid prompt token to seed generation.
+                if not bool(query_mask[0, last_valid_idx[0]].item()):
+                    last_output, kv_cache = self._run_non_donor_only_prefill(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        kv_cache=kv_cache,
+                    )
+                else:
+                    query_indices = torch.nonzero(query_mask[0], as_tuple=False).flatten()
+                    if query_indices.numel() == 0:
+                        last_output, kv_cache = self._run_non_donor_only_prefill(
+                            input_ids=input_ids,
+                            attention_mask=attention_mask,
+                            kv_cache=kv_cache,
+                        )
+                    else:
+                        self._mark_query_only(kv_cache)
+                        query_ids = input_ids[:, query_indices]
+                        query_embd = self.right_tower.token_embedding(query_ids)
+
+                        if getattr(self.cfg, "lm_pad_aware_rope", False):
+                            full_pos = attention_mask.to(torch.long).cumsum(dim=1) - 1
+                            full_pos = full_pos.masked_fill(attention_mask == 0, 0)
+                            query_pos_ids = full_pos[:, query_indices]
+                        else:
+                            query_pos_ids = query_indices.unsqueeze(0)
+
+                        query_output, kv_cache = self.right_tower.forward(
+                            x=query_embd,
+                            attention_mask=attention_mask,
+                            kv_cache=kv_cache,
+                            start_pos=query_pos_ids,
+                        )
+                        self._clear_query_only(kv_cache)
+                        last_output = query_output[:, -1, :]
+        else:
+            raise ValueError(
+                f"Unsupported right_prefill_mode={self.right_prefill_mode!r} in generate()."
+            )
         
         # Get logits from the last token output
         if not self.right_tower.lm_use_tokens:
@@ -459,6 +614,8 @@ class DualTowerVLM(nn.Module):
         
         newly_generated_ids_list = []
         current_attention_mask = attention_mask.clone()
+        finished = None
+        eos_token_id = self.tokenizer.eos_token_id
         
         # Autoregressive generation loop
         for _ in range(max_new_tokens):
@@ -469,20 +626,45 @@ class DualTowerVLM(nn.Module):
                 filtered_logits = top_k_top_p_filtering(current_logits, top_k=top_k, top_p=top_p)
                 probs = torch.softmax(filtered_logits / temperature, dim=-1)
                 next_token_id = torch.multinomial(probs, num_samples=1)
-            
+
+            if eos_token_id is not None:
+                if finished is None:
+                    finished = torch.zeros(B, dtype=torch.bool, device=device)
+                eos_fill = torch.full_like(next_token_id, eos_token_id)
+                next_token_id = torch.where(finished.unsqueeze(1), eos_fill, next_token_id)
+
             newly_generated_ids_list.append(next_token_id)
+
+            if eos_token_id is not None:
+                finished = finished | (next_token_id.squeeze(1) == eos_token_id)
+                if torch.all(finished):
+                    break
             
             # Embed the newly generated token
             next_token_embed = self.right_tower.token_embedding(next_token_id)  # [B, 1, D_lm]
 
             # Decode position must follow KV-cache index space (includes any padded prefix positions).
             current_token_start_pos = kv_cache[0]["key"].size(2)
+            for layer_idx, layer_cache in enumerate(kv_cache):
+                if layer_cache is None or layer_cache.get("key") is None:
+                    raise ValueError(f"Missing KV cache at layer {layer_idx} during decode.")
+                if layer_cache["key"].size(2) != current_token_start_pos:
+                    raise ValueError(
+                        f"Inconsistent KV cache lengths at decode. "
+                        f"layer0={current_token_start_pos}, layer{layer_idx}={layer_cache['key'].size(2)}"
+                    )
             
             # Update attention mask
             new_token_mask = torch.ones((B, 1), 
                                         dtype=current_attention_mask.dtype, 
                                         device=device)
             current_attention_mask = torch.cat([current_attention_mask, new_token_mask], dim=1)
+            expected_decode_mask_len = current_token_start_pos + 1
+            if current_attention_mask.size(1) != expected_decode_mask_len:
+                raise ValueError(
+                    f"Decode attention_mask length mismatch. "
+                    f"expected={expected_decode_mask_len}, got={current_attention_mask.size(1)}"
+                )
             
             # With KV cache: only process the new token
             decode_step_output, kv_cache = self.right_tower.forward(

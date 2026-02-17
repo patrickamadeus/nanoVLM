@@ -1,0 +1,8 @@
+evaluation:
+  mode: dualtower
+  model: /path/to/checkpoint
+  global_step: 0
+  run_name: dt_eval_run
+  tasks: "mmstar,mme"
+  batch_size: 128
+  limit: null

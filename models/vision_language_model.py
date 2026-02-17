@@ -18,6 +18,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 from safetensors.torch import load_model, save_model
 
+try:
+    from torch._dynamo import disable as _dynamo_disable
+except Exception:
+    # Keep compatibility when torch._dynamo is unavailable.
+    def _dynamo_disable(fn):
+        return fn
+
 class VisionLanguageModel(nn.Module):
     def __init__(self, cfg: VLMConfig, load_backbone=True):
         super().__init__()
@@ -48,6 +55,7 @@ class VisionLanguageModel(nn.Module):
 
         return updated_token_embd
 
+    @_dynamo_disable
     def _process_images(self, images, device):
         if isinstance(images, list):
             if images and isinstance(images[0], list):

@@ -2,6 +2,7 @@ import os
 import math
 import time
 import textwrap
+import tempfile
 import torch
 import wandb
 import numpy
@@ -34,7 +35,9 @@ import models.config as config
 from models.language_model import LanguageModel
 from models.vision_language_model import VisionLanguageModel
 from models.dual_tower.dual_tower import DualTowerVLM
+from train_utils.config_loader import load_yaml_config, apply_object_overrides
 from train_utils.console import ctext, log_debug, log_info, log_success, log_warn, progress_color
+from huggingface_hub import hf_hub_download, upload_file
 
 #Otherwise, the tokenizer will throw a warning
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -51,6 +54,7 @@ warnings.filterwarnings(
 import PIL.PngImagePlugin
 PIL.PngImagePlugin.MAX_TEXT_CHUNK = 100 * 1024 * 1024
 VAL_DEBUG_SAMPLE_INTERVAL = 100
+TRAINING_STATE_FILENAME = "training_state.pt"
 
 def seed_worker(worker_id):
     worker_seed = torch.initial_seed() % 2**32
@@ -145,6 +149,115 @@ def get_optimizer_lrs(optimizer, train_cfg):
         lrs["lr_kv_bridge"] = optimizer.param_groups[param_group_idx]["lr"]
     return lrs
 
+
+def _capture_rng_state():
+    state = {
+        "python": random.getstate(),
+        "numpy": numpy.random.get_state(),
+        "torch_cpu": torch.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        state["torch_cuda"] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def _restore_rng_state(state) -> None:
+    if not state:
+        return
+    if "python" in state:
+        random.setstate(state["python"])
+    if "numpy" in state:
+        numpy.random.set_state(state["numpy"])
+    if "torch_cpu" in state:
+        torch.set_rng_state(state["torch_cpu"])
+    if torch.cuda.is_available() and "torch_cuda" in state:
+        torch.cuda.set_rng_state_all(state["torch_cuda"])
+
+
+def _resolve_training_state_path(source: str) -> str | None:
+    if os.path.isdir(source):
+        candidate = os.path.join(source, TRAINING_STATE_FILENAME)
+        return candidate if os.path.exists(candidate) else None
+    if os.path.isfile(source):
+        candidate = os.path.join(os.path.dirname(source), TRAINING_STATE_FILENAME)
+        return candidate if os.path.exists(candidate) else None
+    try:
+        return hf_hub_download(repo_id=source, filename=TRAINING_STATE_FILENAME)
+    except Exception:
+        return None
+
+
+def _try_load_training_state(source: str):
+    path = _resolve_training_state_path(source)
+    if path is None:
+        return None
+    try:
+        return torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location="cpu")
+
+
+def _move_optimizer_state_to_device(optimizer, device):
+    for state in optimizer.state.values():
+        for key, value in state.items():
+            if torch.is_tensor(value):
+                state[key] = value.to(device)
+
+
+def _fast_forward_dataloader(iterator, steps_to_skip: int) -> int:
+    if steps_to_skip <= 0:
+        return 0
+    skipped = 0
+    for _ in synchronized_dataloader_step(iterator, is_dist()):
+        skipped += 1
+        if skipped >= steps_to_skip:
+            break
+    return skipped
+
+
+def _upload_training_state_to_hub(training_state: dict, repo_id: str, step: int) -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        state_path = os.path.join(tmpdir, TRAINING_STATE_FILENAME)
+        torch.save(training_state, state_path)
+        upload_file(
+            repo_id=repo_id,
+            repo_type="model",
+            path_or_fileobj=state_path,
+            path_in_repo=TRAINING_STATE_FILENAME,
+            commit_message=f"Upload training state at step {step}",
+        )
+
+
+def _apply_yaml_train_overrides(config_path: str, vlm_cfg, train_cfg):
+    raw = load_yaml_config(config_path)
+    mode = raw.get("mode")
+
+    vlm_overrides = raw.get("vlm")
+    train_overrides = raw.get("train")
+
+    if vlm_overrides is None:
+        vlm_overrides = {}
+    if train_overrides is None:
+        train_overrides = {}
+
+    if not vlm_overrides and not train_overrides:
+        # Flat fallback for simpler config files.
+        vlm_overrides = {k: v for k, v in raw.items() if hasattr(vlm_cfg, k)}
+        train_overrides = {k: v for k, v in raw.items() if hasattr(train_cfg, k)}
+
+    apply_object_overrides(vlm_cfg, vlm_overrides, object_name="VLMConfig")
+    apply_object_overrides(
+        train_cfg,
+        train_overrides,
+        object_name="TrainConfig",
+        tuple_fields={"train_dataset_name"},
+    )
+
+    if mode is not None and mode not in {"nanovlm", "dualtower"}:
+        raise ValueError("YAML `mode` must be one of ['nanovlm', 'dualtower'].")
+
+    return mode
+
 def _combine_split_datasets(datasets_to_combine, stream_dataset):
     if not datasets_to_combine:
         raise ValueError("No datasets were provided to combine.")
@@ -170,7 +283,7 @@ def _load_dataset_split(train_cfg, dataset_name, split_name):
     )
     return ds
 
-def get_dataloaders(train_cfg, vlm_cfg):
+def get_dataloaders(train_cfg, vlm_cfg, generator_states: dict | None = None):
     log_info(f"Getting dataloaders from {ctext(train_cfg.train_dataset_path, 'cyan', attrs=('bold',))}")
     if train_cfg.max_sample_length > vlm_cfg.lm_max_length:
         raise ValueError(
@@ -289,8 +402,16 @@ def get_dataloaders(train_cfg, vlm_cfg):
     collator_max_len = vlm_cfg.lm_max_length if train_cfg.use_packing else train_cfg.max_sample_length
     vqa_collator = VQACollator(tokenizer, collator_max_len)
 
-    g = torch.Generator()
-    g.manual_seed(0)
+    train_generator = torch.Generator()
+    val_generator = torch.Generator()
+    if generator_states is not None and generator_states.get("train") is not None:
+        train_generator.set_state(generator_states["train"])
+    else:
+        train_generator.manual_seed(0)
+    if generator_states is not None and generator_states.get("val") is not None:
+        val_generator.set_state(generator_states["val"])
+    else:
+        val_generator.manual_seed(0)
 
     # Create dataloaders
 
@@ -298,43 +419,56 @@ def get_dataloaders(train_cfg, vlm_cfg):
         train_dataset,
         batch_size=train_cfg.batch_size,    # =per device BS in DDP
         collate_fn=vqa_collator,
-        num_workers=1,
+        num_workers=2,
         pin_memory=False,
         persistent_workers=False,
         drop_last=True,
         worker_init_fn=seed_worker,
-        generator=g,
+        generator=train_generator,
     )
 
     val_loader = DataLoader(
         val_dataset,
         batch_size=train_cfg.batch_size,
         collate_fn=vqa_collator,
-        num_workers=1,
+        num_workers=2,
         pin_memory=False,
         persistent_workers=False,
         drop_last=True,
         worker_init_fn=seed_worker,
-        generator=g,
+        generator=val_generator,
     )
 
     # Warmup dataloaders to kickstart worker processes
     log_info("Warming up dataloaders...")
+    warmup_train_iter = iter(train_loader)
+    warmup_val_iter = iter(val_loader)
+    next(warmup_train_iter)
+    next(warmup_val_iter)
     iter_train_loader = iter(train_loader)
     iter_val_loader = iter(val_loader)
-    next(iter_train_loader)
-    next(iter_val_loader)
     log_success("Warmup complete.")
 
-    return train_loader, val_loader, iter_train_loader, iter_val_loader
+    generators = {"train": train_generator, "val": val_generator}
+    return train_loader, val_loader, iter_train_loader, iter_val_loader, generators
 
 # Cosine learning rate schedule with warmup (from Karpathy)
 # https://github.com/karpathy/build-nanogpt/blob/master/train_gpt2.py#L353
-def get_lr(it, max_lr, max_steps):
+def get_lr(it, max_lr, max_steps, warmup_ratio=0.03):
+    if max_steps <= 0:
+        raise ValueError("max_steps must be > 0 for LR schedule.")
+    if not (0.0 <= warmup_ratio < 1.0):
+        raise ValueError(f"warmup_ratio must be in [0, 1), got {warmup_ratio}.")
+
     min_lr = max_lr * 0.1
-    warmup_steps = max_steps * 0.03
+    warmup_steps = int(max_steps * warmup_ratio)
+    if max_steps > 1:
+        warmup_steps = min(warmup_steps, max_steps - 1)
+    else:
+        warmup_steps = 0
+
     # 1) linear warmup for warmup_iters steps
-    if it < warmup_steps:
+    if warmup_steps > 0 and it < warmup_steps:
         return max_lr * (it+1) / warmup_steps
     # 2) if it > lr_decay_iters, return min learning rate
     if it > max_steps:
@@ -399,17 +533,46 @@ def _build_decode_preview(model, logits, labels):
     return pred_text, target_text
 
 
-def _apply_checkpoint_cfg_overrides(loaded_cfg, requested_cfg):
+def _validate_checkpoint_cfg_compatibility(loaded_cfg, requested_cfg):
     if loaded_cfg is None:
         raise ValueError("Loaded checkpoint model is missing `cfg`.")
-    loaded_cfg.lm_max_length = requested_cfg.lm_max_length
-    loaded_cfg.lm_max_position_embeddings = requested_cfg.lm_max_position_embeddings
-    loaded_cfg.resize_to_max_side_len = getattr(requested_cfg, "resize_to_max_side_len", False)
-    return loaded_cfg
+    architecture_fields = (
+        "vit_hidden_dim",
+        "vit_patch_size",
+        "vit_img_size",
+        "vit_n_heads",
+        "vit_n_blocks",
+        "lm_hidden_dim",
+        "lm_inter_dim",
+        "lm_n_heads",
+        "lm_n_kv_heads",
+        "lm_n_blocks",
+        "lm_vocab_size",
+        "mp_pixel_shuffle_factor",
+        "mp_image_token_length",
+    )
+    mismatches = []
+    for field in architecture_fields:
+        loaded_value = getattr(loaded_cfg, field, None)
+        requested_value = getattr(requested_cfg, field, None)
+        if loaded_value != requested_value:
+            mismatches.append((field, loaded_value, requested_value))
+
+    if mismatches:
+        mismatch_lines = "\n".join(
+            f"- {name}: checkpoint={loaded}, requested={requested}"
+            for name, loaded, requested in mismatches
+        )
+        raise ValueError(
+            "Checkpoint architecture/config mismatch. Update YAML/CLI to match checkpoint:\n"
+            f"{mismatch_lines}"
+        )
 
 def train(train_cfg, vlm_cfg, model_mode: str = "nanovlm"):
     if train_cfg.checkpoint_interval <= 0:
         raise ValueError("checkpoint_interval must be > 0.")
+    if not (0.0 <= train_cfg.warmup_ratio < 1.0):
+        raise ValueError(f"warmup_ratio must be in [0, 1), got {train_cfg.warmup_ratio}.")
     try:
         train_cfg.checkpoint_repo_pattern.format(step=1, i=1)
     except Exception as e:
@@ -421,7 +584,39 @@ def train(train_cfg, vlm_cfg, model_mode: str = "nanovlm"):
             "use_lmms_eval=True is not supported in this hub-only checkpoint workflow."
         )
 
-    train_loader, val_loader, iter_train_loader, iter_val_loader = get_dataloaders(train_cfg, vlm_cfg)
+    loaded_training_state = None
+    resume_epoch = 0
+    resume_micro_step_in_epoch = 0
+    resume_epoch_start_rng_state = None
+    resume_current_rng_state = None
+    dataloader_generator_states = None
+    if train_cfg.resume_from_vlm_checkpoint and vlm_cfg.vlm_checkpoint_path:
+        loaded_training_state = _try_load_training_state(vlm_cfg.vlm_checkpoint_path)
+        if loaded_training_state is not None:
+            resume_epoch = int(loaded_training_state.get("epoch", 0))
+            resume_micro_step_in_epoch = int(loaded_training_state.get("micro_step_in_epoch", 0))
+            resume_epoch_start_rng_state = loaded_training_state.get("epoch_start_rng_state")
+            resume_current_rng_state = loaded_training_state.get("rng_state")
+            if (
+                resume_micro_step_in_epoch > 0
+                and loaded_training_state.get("epoch_start_dataloader_generator_state") is not None
+            ):
+                dataloader_generator_states = loaded_training_state.get("epoch_start_dataloader_generator_state")
+            else:
+                dataloader_generator_states = loaded_training_state.get("dataloader_generator_state")
+            log_info(
+                f"Found training state at step "
+                f"{ctext(int(loaded_training_state.get('global_step', 0)), 'cyan', attrs=('bold',))} "
+                f"(epoch={resume_epoch}, micro_step={resume_micro_step_in_epoch})."
+            )
+        else:
+            log_info("No resumable training state found; starting optimizer/data state from scratch.")
+
+    train_loader, val_loader, iter_train_loader, iter_val_loader, dataloader_generators = get_dataloaders(
+        train_cfg,
+        vlm_cfg,
+        generator_states=dataloader_generator_states,
+    )
 
     if is_dist():
         log_info(f"Rank {get_rank()} waiting for all workers to get dataloaders...")
@@ -436,7 +631,7 @@ def train(train_cfg, vlm_cfg, model_mode: str = "nanovlm"):
     if train_cfg.log_wandb and is_master():
         run = wandb.init(
             # entity=train_cfg.wandb_entity,
-            project="dualtower",
+            project="dualtower-kvbridge",
             config={
                 "VLMConfig": asdict(vlm_cfg),
                 "TrainConfig": asdict(train_cfg)
@@ -447,23 +642,36 @@ def train(train_cfg, vlm_cfg, model_mode: str = "nanovlm"):
     # Initialize model
     if train_cfg.resume_from_vlm_checkpoint:
         log_info(f"Loading VLM checkpoint: {ctext(vlm_cfg.vlm_checkpoint_path, 'cyan', attrs=('bold',))}")
-        vlm_model = VisionLanguageModel.from_pretrained(vlm_cfg.vlm_checkpoint_path)
-        vlm_cfg = _apply_checkpoint_cfg_overrides(getattr(vlm_model, "cfg", None), vlm_cfg)
         if model_mode == "dualtower":
-            model = DualTowerVLM(
-                vlm_cfg,
-                load_backbone=False,
-            )
-            model.left_tower.vision_encoder.load_state_dict(vlm_model.vision_encoder.state_dict())
-            model.left_tower.MP.load_state_dict(vlm_model.MP.state_dict())
-            model.left_tower.decoder.load_state_dict(vlm_model.decoder.state_dict())
-            right_lm = LanguageModel.from_pretrained(vlm_cfg)
-            model.right_tower.load_state_dict(right_lm.state_dict())
-            del right_lm
-            del vlm_model
-            log_success("Initialized dualtower from VLM checkpoint (left tower) + LM backbone (right tower).")
+            try:
+                model = DualTowerVLM.from_pretrained(
+                    vlm_cfg.vlm_checkpoint_path,
+                    load_backbone=False,
+                )
+                _validate_checkpoint_cfg_compatibility(getattr(model, "cfg", None), vlm_cfg)
+                log_success("Loaded full DualTower checkpoint.")
+            except Exception as dualtower_resume_error:
+                log_warn(
+                    "DualTower direct resume failed, falling back to VLM->DualTower initialization: "
+                    f"{dualtower_resume_error}"
+                )
+                vlm_model = VisionLanguageModel.from_pretrained(vlm_cfg.vlm_checkpoint_path)
+                _validate_checkpoint_cfg_compatibility(getattr(vlm_model, "cfg", None), vlm_cfg)
+                model = DualTowerVLM(
+                    vlm_cfg,
+                    load_backbone=False,
+                )
+                model.left_tower.vision_encoder.load_state_dict(vlm_model.vision_encoder.state_dict())
+                model.left_tower.MP.load_state_dict(vlm_model.MP.state_dict())
+                model.left_tower.decoder.load_state_dict(vlm_model.decoder.state_dict())
+                right_lm = LanguageModel.from_pretrained(vlm_cfg)
+                model.right_tower.load_state_dict(right_lm.state_dict())
+                del right_lm
+                del vlm_model
+                log_success("Initialized dualtower from VLM checkpoint (left tower) + LM backbone (right tower).")
         else:
-            model = vlm_model
+            model = VisionLanguageModel.from_pretrained(vlm_cfg.vlm_checkpoint_path)
+            _validate_checkpoint_cfg_compatibility(getattr(model, "cfg", None), vlm_cfg)
 
         # Override model's max_seq_len, max_position_embeddings, and any relevant sample length to config values
         # Use attribute names as in VLMConfig (lm_max_length, lm_max_position_embeddings, max_sample_length)
@@ -563,21 +771,18 @@ def train(train_cfg, vlm_cfg, model_mode: str = "nanovlm"):
 
     if model_mode == "dualtower" and hasattr(model, "left_tower") and hasattr(model, "right_tower"):
         kv_bridge_module = getattr(model, "kv_bridge", None)
+        bridge_only_mode = bool(getattr(vlm_cfg, "use_kv_bridge", False))
 
-        if train_cfg.dualtower_bridge_only:
+        if bridge_only_mode:
             if kv_bridge_module is None:
-                raise ValueError("dualtower_bridge_only=True requires kv_bridge_enabled=True.")
+                raise ValueError("use_kv_bridge=True requires DualTowerVLM.kv_bridge to be initialized.")
             if kv_bridge_lr is None or kv_bridge_lr <= 0:
-                raise ValueError("dualtower_bridge_only=True requires lr_kv_bridge > 0.")
+                raise ValueError("use_kv_bridge=True requires lr_kv_bridge > 0.")
 
-            for module in (
-                model.left_tower.vision_encoder,
-                model.left_tower.MP,
-                model.left_tower.decoder,
-                model.right_tower,
-            ):
-                for p in module.parameters():
-                    p.requires_grad = False
+            for p in model.parameters():
+                p.requires_grad = False
+            for p in kv_bridge_module.parameters():
+                p.requires_grad = True
 
             param_groups.append({'name': 'lr_kv_bridge', 'params': list(kv_bridge_module.parameters()), 'lr': kv_bridge_lr})
         else:
@@ -672,7 +877,54 @@ def train(train_cfg, vlm_cfg, model_mode: str = "nanovlm"):
     checkpoint_repo_by_step = {}
     global_step = 0
     epoch = 0
-    
+    resume_epoch_target = None
+    pending_resume_skip = 0
+
+    if loaded_training_state is not None:
+        optimizer_state = loaded_training_state.get("optimizer")
+        if optimizer_state is not None:
+            try:
+                optimizer.load_state_dict(optimizer_state)
+                _move_optimizer_state_to_device(optimizer, device)
+            except Exception as optimizer_resume_error:
+                log_warn(
+                    "Failed to load optimizer state from training checkpoint; "
+                    f"continuing without optimizer resume: {optimizer_resume_error}"
+                )
+                loaded_training_state = None
+        if loaded_training_state is None:
+            pass
+        else:
+            global_step = int(loaded_training_state.get("global_step", 0))
+            best_val_loss = float(loaded_training_state.get("best_val_loss", best_val_loss))
+            best_val_step = loaded_training_state.get("best_val_step")
+            checkpoint_repo_by_step = dict(loaded_training_state.get("checkpoint_repo_by_step", {}))
+            best_checkpoint_repo_id = loaded_training_state.get("best_checkpoint_repo_id")
+            if best_checkpoint_repo_id is None and best_val_step is not None:
+                best_checkpoint_repo_id = checkpoint_repo_by_step.get(best_val_step)
+
+            if resume_epoch > 0:
+                if resume_micro_step_in_epoch > 0:
+                    epoch = resume_epoch - 1
+                    resume_epoch_target = resume_epoch
+                    pending_resume_skip = resume_micro_step_in_epoch
+                else:
+                    epoch = resume_epoch
+            if global_step >= train_cfg.max_training_steps:
+                log_success(
+                    f"Training state is already at/above max_training_steps "
+                    f"({global_step} >= {train_cfg.max_training_steps}). Nothing to do."
+                )
+                return
+            if pending_resume_skip == 0 and resume_current_rng_state is not None:
+                _restore_rng_state(resume_current_rng_state)
+            log_info(
+                f"Resuming optimizer/global state from step "
+                f"{ctext(global_step, 'cyan', attrs=('bold',))}, "
+                f"epoch={epoch if pending_resume_skip == 0 else resume_epoch}, "
+                f"pending_micro_skip={pending_resume_skip}."
+            )
+
     # Training stats accumulators
     accumulated_stats = {
         'tokens_per_second': [],
@@ -680,7 +932,9 @@ def train(train_cfg, vlm_cfg, model_mode: str = "nanovlm"):
         'fw_bw_time': [],
         'post_process_time': [],
         'images_per_sample': [],
-        'effective_token_ratio_per_instance': [],
+        # Non-padding token utilization (independent of target label masking).
+        'non_padding_token_ratio_per_batch': [],
+        'non_padding_tokens_per_batch': [],
     }
     
     while global_step < train_cfg.max_training_steps:
@@ -693,8 +947,9 @@ def train(train_cfg, vlm_cfg, model_mode: str = "nanovlm"):
         optimizer.zero_grad()
         accumulated_loss_sum = torch.zeros((), device=device, dtype=torch.float32)
         accumulated_loss_tokens = torch.zeros((), device=device, dtype=torch.float32)
-        accumulated_effective_ratio_sum = torch.zeros((), device=device, dtype=torch.float32)
-        accumulated_effective_ratio_count = torch.zeros((), device=device, dtype=torch.float32)
+        accumulated_non_padding_tokens_sum = torch.zeros((), device=device, dtype=torch.float32)
+        accumulated_non_padding_slots_sum = torch.zeros((), device=device, dtype=torch.float32)
+        accumulated_microbatch_count = torch.zeros((), device=device, dtype=torch.float32)
         data_load_start = time.time()
 
         log_info(f"Starting training loop for epoch {ctext(epoch, 'cyan', attrs=('bold',))}")
@@ -706,12 +961,41 @@ def train(train_cfg, vlm_cfg, model_mode: str = "nanovlm"):
             disable=not is_master(),
             leave=False,
         )
+        epoch_start_rng_state = _capture_rng_state()
+        epoch_start_dataloader_generator_state = {
+            "train": dataloader_generators["train"].get_state().clone(),
+            "val": dataloader_generators["val"].get_state().clone(),
+        }
+        if pending_resume_skip > 0 and resume_epoch_target == epoch:
+            if resume_epoch_start_rng_state is not None:
+                epoch_start_rng_state = resume_epoch_start_rng_state
+                _restore_rng_state(resume_epoch_start_rng_state)
+            else:
+                log_warn(
+                    "Resume state is missing epoch_start_rng_state; "
+                    "dataloader fast-forward will be best-effort."
+                )
+            skipped_batches = _fast_forward_dataloader(iter_train_loader, pending_resume_skip)
+            if skipped_batches != pending_resume_skip:
+                raise ValueError(
+                    f"Failed to fast-forward dataloader to resume point. "
+                    f"Expected {pending_resume_skip}, skipped {skipped_batches}."
+                )
+            if resume_current_rng_state is not None:
+                _restore_rng_state(resume_current_rng_state)
+            log_info(
+                f"Fast-forwarded dataloader by {ctext(skipped_batches, 'cyan', attrs=('bold',))} "
+                f"microbatches in epoch {ctext(epoch, 'cyan', attrs=('bold',))}."
+            )
+            pending_resume_skip = 0
+
         for i, batch in enumerate(synchronized_dataloader_step(iter_train_loader, is_dist())):
             is_update_step = (i + 1) % train_cfg.gradient_accumulation_steps == 0
             step_after_update = global_step + 1 if is_update_step else global_step
             grad_norm_value = None
             update_loss_value = None
-            step_effective_token_ratio_value = None
+            step_non_padding_token_ratio_value = None
+            step_non_padding_tokens_value = None
             batch_start_time = time.time()
             images = batch["images"]
             input_ids = batch["input_ids"].to(device)
@@ -749,11 +1033,15 @@ def train(train_cfg, vlm_cfg, model_mode: str = "nanovlm"):
                         raise ValueError("Found a batch with no valid target tokens; check label masking.")
                     accumulated_loss_sum += loss.detach().to(dtype=torch.float32)
                     accumulated_loss_tokens += loss_token_count.to(dtype=torch.float32)
-                    valid_tokens_per_sample = (labels != -100).sum(dim=1).to(dtype=torch.float32)
-                    attention_tokens_per_sample = attention_mask.sum(dim=1).to(dtype=torch.float32).clamp_min(1.0)
-                    effective_token_ratio_per_sample = valid_tokens_per_sample / attention_tokens_per_sample
-                    accumulated_effective_ratio_sum += effective_token_ratio_per_sample.sum()
-                    accumulated_effective_ratio_count += float(effective_token_ratio_per_sample.numel())
+                    batch_non_padding_tokens_tensor = attention_mask.sum().to(dtype=torch.float32)
+                    batch_token_slots_tensor = torch.tensor(
+                        float(attention_mask.numel()),
+                        device=device,
+                        dtype=torch.float32,
+                    )
+                    accumulated_non_padding_tokens_sum += batch_non_padding_tokens_tensor
+                    accumulated_non_padding_slots_sum += batch_token_slots_tensor
+                    accumulated_microbatch_count += 1.0
 
             loss.backward()
 
@@ -771,15 +1059,19 @@ def train(train_cfg, vlm_cfg, model_mode: str = "nanovlm"):
                     raise ValueError("Gradient accumulation produced zero total target tokens; check label masking.")
 
                 update_loss_value = (total_loss_sum / total_loss_tokens).item()
-                total_effective_ratio_sum = accumulated_effective_ratio_sum.clone()
-                total_effective_ratio_count = accumulated_effective_ratio_count.clone()
+                total_non_padding_tokens = accumulated_non_padding_tokens_sum.clone()
+                total_non_padding_slots = accumulated_non_padding_slots_sum.clone()
+                total_microbatch_count = accumulated_microbatch_count.clone()
                 if is_dist():
-                    dist.all_reduce(total_effective_ratio_sum, op=dist.ReduceOp.SUM)
-                    dist.all_reduce(total_effective_ratio_count, op=dist.ReduceOp.SUM)
-                total_effective_ratio_count_value = total_effective_ratio_count.item()
-                if total_effective_ratio_count_value <= 0:
-                    raise ValueError("Gradient accumulation produced zero instances; cannot compute effective token ratio.")
-                step_effective_token_ratio_value = (total_effective_ratio_sum / total_effective_ratio_count).item()
+                    dist.all_reduce(total_non_padding_tokens, op=dist.ReduceOp.SUM)
+                    dist.all_reduce(total_non_padding_slots, op=dist.ReduceOp.SUM)
+                    dist.all_reduce(total_microbatch_count, op=dist.ReduceOp.SUM)
+                total_non_padding_slots_value = total_non_padding_slots.item()
+                total_microbatch_count_value = total_microbatch_count.item()
+                if total_non_padding_slots_value <= 0 or total_microbatch_count_value <= 0:
+                    raise ValueError("Gradient accumulation produced zero token slots/batches; cannot compute non-padding token stats.")
+                step_non_padding_token_ratio_value = (total_non_padding_tokens / total_non_padding_slots).item()
+                step_non_padding_tokens_value = (total_non_padding_tokens / total_microbatch_count).item()
                 grad_scale = get_world_size() / total_loss_tokens_value
                 for param in all_params:
                     if param.grad is not None:
@@ -820,17 +1112,24 @@ def train(train_cfg, vlm_cfg, model_mode: str = "nanovlm"):
                         )
 
                     if max_lr is not None and max_lr > 0:
-                        group['lr'] = get_lr(step_after_update, max_lr, train_cfg.max_training_steps)
+                        group['lr'] = get_lr(
+                            step_after_update,
+                            max_lr,
+                            train_cfg.max_training_steps,
+                            warmup_ratio=train_cfg.warmup_ratio,
+                        )
               
                 optimizer.step()
                 optimizer.zero_grad()
                 accumulated_loss_sum.zero_()
                 accumulated_loss_tokens.zero_()
-                accumulated_effective_ratio_sum.zero_()
-                accumulated_effective_ratio_count.zero_()
+                accumulated_non_padding_tokens_sum.zero_()
+                accumulated_non_padding_slots_sum.zero_()
+                accumulated_microbatch_count.zero_()
 
             batch_loss = loss.item() / loss_token_count_value
-            batch_effective_token_ratio = effective_token_ratio_per_sample.mean().item()
+            batch_non_padding_tokens = float(attention_mask.sum().item())
+            batch_non_padding_token_ratio = batch_non_padding_tokens / max(float(attention_mask.numel()), 1.0)
             total_train_loss_sum += float(loss.item())
             total_train_loss_tokens += loss_token_count_value
 
@@ -850,7 +1149,8 @@ def train(train_cfg, vlm_cfg, model_mode: str = "nanovlm"):
             accumulated_stats['fw_bw_time'].append(fw_bw_time)
             accumulated_stats['post_process_time'].append(post_process_time)
             accumulated_stats['images_per_sample'].extend(images_per_sample)
-            accumulated_stats['effective_token_ratio_per_instance'].append(batch_effective_token_ratio)
+            accumulated_stats['non_padding_token_ratio_per_batch'].append(batch_non_padding_token_ratio)
+            accumulated_stats['non_padding_tokens_per_batch'].append(batch_non_padding_tokens)
             
             if (
                 train_cfg.eval_in_epochs
@@ -953,6 +1253,34 @@ def train(train_cfg, vlm_cfg, model_mode: str = "nanovlm"):
                     checkpoint_repo_id,
                     private=train_cfg.hf_private,
                 )
+                if train_cfg.save_training_state_to_hub:
+                    training_state = {
+                        "format_version": 1,
+                        "model_mode": model_mode,
+                        "global_step": int(step_after_update),
+                        "epoch": int(epoch),
+                        "micro_step_in_epoch": int(i + 1),
+                        "best_val_loss": float(best_val_loss),
+                        "best_val_step": best_val_step,
+                        "best_checkpoint_repo_id": best_checkpoint_repo_id,
+                        "checkpoint_repo_by_step": dict(checkpoint_repo_by_step),
+                        "optimizer": optimizer.state_dict(),
+                        "rng_state": _capture_rng_state(),
+                        "epoch_start_rng_state": epoch_start_rng_state,
+                        "dataloader_generator_state": {
+                            "train": dataloader_generators["train"].get_state().clone(),
+                            "val": dataloader_generators["val"].get_state().clone(),
+                        },
+                        "epoch_start_dataloader_generator_state": {
+                            "train": epoch_start_dataloader_generator_state["train"].clone(),
+                            "val": epoch_start_dataloader_generator_state["val"].clone(),
+                        },
+                    }
+                    _upload_training_state_to_hub(
+                        training_state,
+                        repo_id=checkpoint_repo_id,
+                        step=step_after_update,
+                    )
                 checkpoint_repo_by_step[step_after_update] = checkpoint_repo_id
                 if best_val_step == step_after_update:
                     best_checkpoint_repo_id = checkpoint_repo_id
@@ -967,7 +1295,15 @@ def train(train_cfg, vlm_cfg, model_mode: str = "nanovlm"):
             ):
                 # ALL RANKS: Perform collective operations for training stats
                 stats = {}
-                for key in ['tokens_per_second', 'data_load_time', 'fw_bw_time', 'post_process_time', 'images_per_sample', 'effective_token_ratio_per_instance']:
+                for key in [
+                    'tokens_per_second',
+                    'data_load_time',
+                    'fw_bw_time',
+                    'post_process_time',
+                    'images_per_sample',
+                    'non_padding_token_ratio_per_batch',
+                    'non_padding_tokens_per_batch',
+                ]:
                     if is_dist():
                         all_values = dist_gather(accumulated_stats[key])
                         all_values_flat = [item for sublist in all_values for item in sublist]  # Flatten list of lists
@@ -1003,16 +1339,22 @@ def train(train_cfg, vlm_cfg, model_mode: str = "nanovlm"):
 
                 if is_master():
                     update_loss_text = update_loss_value if update_loss_value is not None else batch_loss
-                    step_effective_ratio_text = (
-                        step_effective_token_ratio_value
-                        if step_effective_token_ratio_value is not None
-                        else batch_effective_token_ratio
+                    step_non_padding_ratio_text = (
+                        step_non_padding_token_ratio_value
+                        if step_non_padding_token_ratio_value is not None
+                        else batch_non_padding_token_ratio
+                    )
+                    step_non_padding_tokens_text = (
+                        step_non_padding_tokens_value
+                        if step_non_padding_tokens_value is not None
+                        else batch_non_padding_tokens
                     )
                     log_info(
                         f"[TRAIN] step={step_after_update} "
                         f"batch_loss={batch_loss:.4f} "
                         f"step_loss={update_loss_text:.4f} "
-                        f"effective_token_ratio_per_instance={step_effective_ratio_text:.4f} "
+                        f"non_padding_token_ratio_per_batch={step_non_padding_ratio_text:.4f} "
+                        f"non_padding_tokens_per_batch={step_non_padding_tokens_text:.2f} "
                         f"tokens_per_second={stats['avg_tokens_per_second']:.2f} "
                         f"lr_mp={stats.get('lr_mp', 0.0):.6g} "
                         f"lr_vision={stats.get('lr_vision_backbone', 0.0):.6g} "
@@ -1032,30 +1374,42 @@ def train(train_cfg, vlm_cfg, model_mode: str = "nanovlm"):
                 # ALL RANKS: gather loss from all ranks if DDP
                 microbatch_loss_for_log = batch_loss
                 step_loss_for_log = update_loss_value if update_loss_value is not None else batch_loss
-                microbatch_effective_ratio_for_log = batch_effective_token_ratio
-                step_effective_ratio_for_log = (
-                    step_effective_token_ratio_value
-                    if step_effective_token_ratio_value is not None
-                    else batch_effective_token_ratio
+                microbatch_non_padding_ratio_for_log = batch_non_padding_token_ratio
+                step_non_padding_ratio_for_log = (
+                    step_non_padding_token_ratio_value
+                    if step_non_padding_token_ratio_value is not None
+                    else batch_non_padding_token_ratio
+                )
+                microbatch_non_padding_tokens_for_log = batch_non_padding_tokens
+                step_non_padding_tokens_for_log = (
+                    step_non_padding_tokens_value
+                    if step_non_padding_tokens_value is not None
+                    else batch_non_padding_tokens
                 )
                 if is_dist():
                     microbatch_loss_gathered = dist_mean_scalar(microbatch_loss_for_log)
                     step_loss_gathered = dist_mean_scalar(step_loss_for_log)
-                    microbatch_effective_ratio_gathered = dist_mean_scalar(microbatch_effective_ratio_for_log)
-                    step_effective_ratio_gathered = dist_mean_scalar(step_effective_ratio_for_log)
+                    microbatch_non_padding_ratio_gathered = dist_mean_scalar(microbatch_non_padding_ratio_for_log)
+                    step_non_padding_ratio_gathered = dist_mean_scalar(step_non_padding_ratio_for_log)
+                    microbatch_non_padding_tokens_gathered = dist_mean_scalar(microbatch_non_padding_tokens_for_log)
+                    step_non_padding_tokens_gathered = dist_mean_scalar(step_non_padding_tokens_for_log)
                 else:
                     microbatch_loss_gathered = microbatch_loss_for_log
                     step_loss_gathered = step_loss_for_log
-                    microbatch_effective_ratio_gathered = microbatch_effective_ratio_for_log
-                    step_effective_ratio_gathered = step_effective_ratio_for_log
+                    microbatch_non_padding_ratio_gathered = microbatch_non_padding_ratio_for_log
+                    step_non_padding_ratio_gathered = step_non_padding_ratio_for_log
+                    microbatch_non_padding_tokens_gathered = microbatch_non_padding_tokens_for_log
+                    step_non_padding_tokens_gathered = step_non_padding_tokens_for_log
                     
                 # MASTER ONLY: Log to wandb
                 if train_cfg.log_wandb and is_master():
                     run.log({
                         "train/batch_loss": microbatch_loss_gathered,
                         "train/step_loss": step_loss_gathered,
-                        "train/batch_effective_token_ratio_per_instance": microbatch_effective_ratio_gathered,
-                        "train/step_effective_token_ratio_per_instance": step_effective_ratio_gathered,
+                        "train/batch_non_padding_token_ratio_per_batch": microbatch_non_padding_ratio_gathered,
+                        "train/step_non_padding_token_ratio_per_batch": step_non_padding_ratio_gathered,
+                        "train/batch_non_padding_tokens_per_batch": microbatch_non_padding_tokens_gathered,
+                        "train/step_non_padding_tokens_per_batch": step_non_padding_tokens_gathered,
                         **({"grad_norm": grad_norm_value} if grad_norm_value is not None else {})
                     }, step=step_after_update)
                 
@@ -1139,6 +1493,7 @@ def train(train_cfg, vlm_cfg, model_mode: str = "nanovlm"):
 def main():
     global PG_CPU
     parser = argparse.ArgumentParser()
+    parser.add_argument('--config', type=str, help='Path to YAML config file.')
     parser.add_argument('--lr_mp', type=float, help='Learning rate for the mapping network')
     parser.add_argument('--lr_vision_backbone', type=float, help='Learning rate for the vision backbone')
     parser.add_argument('--lr_language_backbone', type=float, help='Learning rate for the language backbone')
@@ -1147,18 +1502,23 @@ def main():
     parser.add_argument('--lr_kv_bridge', type=float, help='DualTower: learning rate for KV bridge module')
     parser.add_argument('--vlm_checkpoint_path', type=str, help='Path or repo ID of the VLM checkpoint for loading')
     parser.add_argument(
-        '--left_tower_mask_mode',
+        '--left_mask_scope',
         type=str,
-        choices=['visual_only', 'visual_plus_prefix', 'full'],
-        help='DualTower left-tower mask mode: visual_only, visual_plus_prefix, or full',
+        choices=['visual_only', 'visual_sys', 'full'],
+        help='DualTower mask/transport scope: visual_only, visual_sys, or full',
     )
-    parser.add_argument('--enable_kv_bridge', action='store_true', help='DualTower: enable learnable KV bridge on all layers')
+    parser.add_argument('--disable_kv_bridge', action='store_true', help='Disable KV bridge (enabled by default).')
+    parser.add_argument('--enable_kv_bridge', action='store_true', help='Legacy compatibility flag. KV bridge is enabled by default.')
     parser.add_argument('--kv_bridge_type', type=str, choices=['linear', 'mlp'], help='DualTower KV bridge architecture')
     parser.add_argument('--kv_bridge_mlp_ratio', type=float, help='DualTower KV bridge MLP hidden ratio')
+    parser.add_argument(
+        '--kv_bridge_init_mode',
+        type=str,
+        choices=['default', 'normal', 'diag_eye'],
+        help='KV bridge initialization mode',
+    )
     parser.add_argument('--kv_bridge_no_rmsnorm', action='store_true', help='Disable KV bridge RMSNorm pre-normalization')
     parser.add_argument('--kv_bridge_no_residual', action='store_true', help='Disable KV bridge residual connection')
-    parser.add_argument('--dualtower_bridge_only', action='store_true', help='Freeze left/right towers and train only KV bridge')
-    parser.add_argument('--left_tower_prefill_no_grad', action='store_true', help='DualTower: run left-tower KV prefill under torch.no_grad() to reduce memory')
     parser.add_argument('--compile', type=bool, help='Use torch.compile to optimize the model')
     parser.add_argument('--log_wandb', type=bool, help='Log to wandb')
     parser.add_argument('--resume_from_vlm_checkpoint', type=bool, default=False, help='Resume training from VLM checkpoint specified by vlm_checkpoint_path (or default if not provided)')
@@ -1169,6 +1529,8 @@ def main():
     parser.add_argument('--val_split', type=str, help='Dataset split name for validation data')
     parser.add_argument('--checkpoint_interval', type=int, help='Push checkpoint to hub every N optimizer steps')
     parser.add_argument('--checkpoint_repo_pattern', type=str, help='Hub repo naming pattern with {i} or {step}, e.g. user/model-step-{i}')
+    parser.add_argument('--no_save_training_state_to_hub', action='store_true', help='Do not upload optimizer/RNG/dataloader training state to checkpoint repos.')
+    parser.add_argument('--warmup_ratio', type=float, help='LR warmup ratio in [0, 1).')
     parser.add_argument('--no_checkpoint_push', action='store_true', help='Disable hub checkpoint pushing')
     parser.add_argument('--no_lmms_eval', action='store_true', help='Disable lmms-eval during training')
     parser.add_argument('--relevance_min_rating', type=int, help='Minimum relevance rating of images per sample')
@@ -1187,6 +1549,10 @@ def main():
 
     vlm_cfg = config.VLMConfig()
     train_cfg = config.TrainConfig()
+    model_mode_from_yaml = None
+
+    if args.config is not None:
+        model_mode_from_yaml = _apply_yaml_train_overrides(args.config, vlm_cfg, train_cfg)
 
     if args.lr_mp is not None:
         train_cfg.lr_mp = args.lr_mp
@@ -1202,22 +1568,22 @@ def main():
         train_cfg.lr_kv_bridge = args.lr_kv_bridge
     if args.vlm_checkpoint_path is not None:
         vlm_cfg.vlm_checkpoint_path = args.vlm_checkpoint_path
-    if args.left_tower_mask_mode is not None:
-        vlm_cfg.left_tower_mask_mode = args.left_tower_mask_mode
+    if args.left_mask_scope is not None:
+        vlm_cfg.left_mask_scope = args.left_mask_scope
+    if args.disable_kv_bridge:
+        vlm_cfg.use_kv_bridge = False
     if args.enable_kv_bridge:
-        vlm_cfg.kv_bridge_enabled = True
+        vlm_cfg.use_kv_bridge = True
     if args.kv_bridge_type is not None:
         vlm_cfg.kv_bridge_type = args.kv_bridge_type
     if args.kv_bridge_mlp_ratio is not None:
         vlm_cfg.kv_bridge_mlp_ratio = args.kv_bridge_mlp_ratio
+    if args.kv_bridge_init_mode is not None:
+        vlm_cfg.kv_bridge_init_mode = args.kv_bridge_init_mode
     if args.kv_bridge_no_rmsnorm:
         vlm_cfg.kv_bridge_use_rmsnorm = False
     if args.kv_bridge_no_residual:
         vlm_cfg.kv_bridge_residual = False
-    if args.dualtower_bridge_only:
-        train_cfg.dualtower_bridge_only = True
-    if args.left_tower_prefill_no_grad:
-        vlm_cfg.left_tower_prefill_no_grad = True
     if args.compile is not None:
         train_cfg.compile = args.compile
     if args.log_wandb is not None:
@@ -1236,6 +1602,10 @@ def main():
         train_cfg.checkpoint_interval = args.checkpoint_interval
     if args.checkpoint_repo_pattern is not None:
         train_cfg.checkpoint_repo_pattern = args.checkpoint_repo_pattern
+    if args.no_save_training_state_to_hub:
+        train_cfg.save_training_state_to_hub = False
+    if args.warmup_ratio is not None:
+        train_cfg.warmup_ratio = args.warmup_ratio
     if args.no_checkpoint_push:
         train_cfg.push_checkpoints_to_hub = False
     if args.no_lmms_eval:
@@ -1251,14 +1621,11 @@ def main():
     if args.use_packing is not None:
         train_cfg.use_packing = args.use_packing
 
-    model_mode = "dualtower" if args.dualtower else "nanovlm"
+    model_mode = model_mode_from_yaml if model_mode_from_yaml is not None else "nanovlm"
+    if args.dualtower:
+        model_mode = "dualtower"
     if args.nanovlm:
         model_mode = "nanovlm"
-
-    if train_cfg.dualtower_bridge_only and model_mode != "dualtower":
-        raise ValueError("--dualtower_bridge_only requires --dualtower mode.")
-    if train_cfg.dualtower_bridge_only:
-        vlm_cfg.left_tower_prefill_no_grad = True
 
     if args.resume_from_vlm_checkpoint and args.vlm_checkpoint_path is not None:
         train_cfg.resume_from_vlm_checkpoint = True
