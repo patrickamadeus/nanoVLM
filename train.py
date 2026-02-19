@@ -376,7 +376,7 @@ def _apply_runtime_dataset_filters(ds, train_cfg, dataset_name, split_name):
     return ds
 
 def _load_dataset_split(train_cfg, dataset_name, split_name):
-    if "shard_" in dataset_name:
+    if isinstance(dataset_name, str) and "shard_" in dataset_name:
         ds = load_from_disk(dataset_name)
         return ds
 
@@ -389,7 +389,8 @@ def _load_dataset_split(train_cfg, dataset_name, split_name):
         streaming=train_cfg.stream_dataset,
         on_bad_files='warn',
     )
-    ds = _apply_runtime_dataset_filters(ds, train_cfg, dataset_name, split_name)
+    dataset_name_for_logs = "default" if hf_config_name is None else str(dataset_name)
+    ds = _apply_runtime_dataset_filters(ds, train_cfg, dataset_name_for_logs, split_name)
     return ds
 
 def get_dataloaders(train_cfg, vlm_cfg, generator_states: dict | None = None):
@@ -409,51 +410,92 @@ def get_dataloaders(train_cfg, vlm_cfg, generator_states: dict | None = None):
         model_max_length=train_cfg.max_sample_length,
     )
 
-    dataset_names_to_load = train_cfg.train_dataset_name
-    if "shards" in train_cfg.train_dataset_name:
+    raw_dataset_names = train_cfg.train_dataset_name
+    if isinstance(raw_dataset_names, str):
+        dataset_names_to_load = [raw_dataset_names]
+    else:
+        dataset_names_to_load = list(raw_dataset_names or ())
+    dataset_names_to_load = [name for name in dataset_names_to_load if name not in ("", None)]
+    use_subset_names = len(dataset_names_to_load) > 0
+
+    if "shards" in dataset_names_to_load:
         log_info("Loading shards")
         total_shards = 56
         dataset_names_to_load = [train_cfg.train_dataset_path + f"/shard_{i}" for i in range(total_shards)]
+        use_subset_names = True
 
-    if "_all_" in dataset_names_to_load:
+    if use_subset_names and any(name in {"_all_", "all"} for name in dataset_names_to_load):
         dataset_names_to_load = get_dataset_config_names(train_cfg.train_dataset_path)
+        if not dataset_names_to_load:
+            raise ValueError(
+                f"Dataset '{train_cfg.train_dataset_path}' did not return any config names for 'all'."
+            )
+
+    def _probe_loaded_dataset(ds):
+        if train_cfg.stream_dataset:
+            next(iter(ds))
+        else:
+            ds[0]
 
     # Load and combine datasets from explicit train/val splits.
     combined_train_data = []
     combined_val_data = []
 
-    for dataset_name in dataset_names_to_load:
-        log_info(f"Loading dataset: {ctext(dataset_name, 'cyan', attrs=('bold',))}")
+    if not use_subset_names:
+        log_info("No dataset subset/config provided. Loading direct splits from dataset root.")
         try:
-            train_ds = _load_dataset_split(train_cfg, dataset_name, train_cfg.train_split)
-            val_ds = _load_dataset_split(train_cfg, dataset_name, train_cfg.val_split)
-
-            if train_cfg.stream_dataset:
-                next(iter(train_ds))
-                next(iter(val_ds))
-            else:
-                train_ds[0]
-                val_ds[0]
-
+            train_ds = _load_dataset_split(train_cfg, None, train_cfg.train_split)
+            _probe_loaded_dataset(train_ds)
             combined_train_data.append(train_ds)
+        except Exception as e:
+            raise ValueError(
+                f"Failed to load training split '{train_cfg.train_split}' from "
+                f"'{train_cfg.train_dataset_path}' without subset/config. Error: {e}"
+            ) from e
+        try:
+            val_ds = _load_dataset_split(train_cfg, None, train_cfg.val_split)
+            _probe_loaded_dataset(val_ds)
             combined_val_data.append(val_ds)
         except Exception as e:
-            if is_master():
-                log_warn(
-                    f"Warning: Failed to load dataset config '{dataset_name}' from "
-                    f"'{train_cfg.train_dataset_path}' with splits "
-                    f"'{train_cfg.train_split}'/'{train_cfg.val_split}'. Error: {e}"
-                )
-            continue
+            log_warn(
+                f"Validation split '{train_cfg.val_split}' is unavailable at dataset root. "
+                f"Validation will be skipped. Error: {e}"
+            )
+    else:
+        for dataset_name in dataset_names_to_load:
+            log_info(f"Loading dataset: {ctext(dataset_name, 'cyan', attrs=('bold',))}")
+            try:
+                train_ds = _load_dataset_split(train_cfg, dataset_name, train_cfg.train_split)
+                _probe_loaded_dataset(train_ds)
+                combined_train_data.append(train_ds)
+            except Exception as e:
+                if is_master():
+                    log_warn(
+                        f"Warning: Failed to load training split for dataset config '{dataset_name}' from "
+                        f"'{train_cfg.train_dataset_path}' with splits "
+                        f"'{train_cfg.train_split}'/'{train_cfg.val_split}'. Error: {e}"
+                    )
+                continue
 
-    if not combined_train_data or not combined_val_data:
+            try:
+                val_ds = _load_dataset_split(train_cfg, dataset_name, train_cfg.val_split)
+                _probe_loaded_dataset(val_ds)
+                combined_val_data.append(val_ds)
+            except Exception as e:
+                if is_master():
+                    log_warn(
+                        f"Validation split '{train_cfg.val_split}' is unavailable for dataset config "
+                        f"'{dataset_name}'. Skipping validation data for this dataset. Error: {e}"
+                    )
+
+    if not combined_train_data:
         raise ValueError(
-            "No valid train/val datasets were loaded. Please check dataset path, "
+            "No valid train datasets were loaded. Please check dataset path, "
             "config names, and split names."
         )
 
     train_ds = _combine_split_datasets(combined_train_data, train_cfg.stream_dataset)
-    val_ds = _combine_split_datasets(combined_val_data, train_cfg.stream_dataset)
+    val_ds = _combine_split_datasets(combined_val_data, train_cfg.stream_dataset) if combined_val_data else None
 
     if not train_cfg.stream_dataset:
         train_ds = train_ds.shuffle(seed=0)
@@ -461,7 +503,8 @@ def get_dataloaders(train_cfg, vlm_cfg, generator_states: dict | None = None):
 
     if is_dist():  # We need to shard the dataset in DDP since we are using an iterable dataset instead of the distributed sampler
         train_ds = train_ds.shard(num_shards=get_world_size(), index=get_rank())
-        val_ds = val_ds.shard(num_shards=get_world_size(), index=get_rank())
+        if val_ds is not None:
+            val_ds = val_ds.shard(num_shards=get_world_size(), index=get_rank())
 
     train_dataset = VQADataset(
         train_ds,
@@ -473,16 +516,18 @@ def get_dataloaders(train_cfg, vlm_cfg, generator_states: dict | None = None):
         train_cfg.visual_dependency_min_rating,
         train_cfg.formatting_min_rating,
     )
-    val_dataset = VQADataset(
-        val_ds,
-        tokenizer,
-        image_processor,
-        vlm_cfg.mp_image_token_length,
-        train_cfg.relevance_min_rating,
-        train_cfg.image_correspondence_min_rating,
-        train_cfg.visual_dependency_min_rating,
-        train_cfg.formatting_min_rating,
-    )
+    val_dataset = None
+    if val_ds is not None:
+        val_dataset = VQADataset(
+            val_ds,
+            tokenizer,
+            image_processor,
+            vlm_cfg.mp_image_token_length,
+            train_cfg.relevance_min_rating,
+            train_cfg.image_correspondence_min_rating,
+            train_cfg.visual_dependency_min_rating,
+            train_cfg.formatting_min_rating,
+        )
 
     if train_cfg.use_packing:
         train_dataset = ConstantLengthDataset(
@@ -496,31 +541,33 @@ def get_dataloaders(train_cfg, vlm_cfg, generator_states: dict | None = None):
             max_images_per_knapsack=train_cfg.max_images_per_knapsack,
         )
 
-        val_dataset = ConstantLengthDataset(
-            val_dataset,
-            infinite=False,
-            max_sample_length=train_cfg.max_sample_length,
-            seq_length=vlm_cfg.lm_max_length,
-            num_of_sequences=train_cfg.batch_size * 4,
-            queue_size=2,
-            max_images_per_example=train_cfg.max_images_per_example,
-            max_images_per_knapsack=train_cfg.max_images_per_knapsack,
-        )
+        if val_dataset is not None:
+            val_dataset = ConstantLengthDataset(
+                val_dataset,
+                infinite=False,
+                max_sample_length=train_cfg.max_sample_length,
+                seq_length=vlm_cfg.lm_max_length,
+                num_of_sequences=train_cfg.batch_size * 4,
+                queue_size=2,
+                max_images_per_example=train_cfg.max_images_per_example,
+                max_images_per_knapsack=train_cfg.max_images_per_knapsack,
+            )
 
     # Create collators
     collator_max_len = vlm_cfg.lm_max_length if train_cfg.use_packing else train_cfg.max_sample_length
     vqa_collator = VQACollator(tokenizer, collator_max_len)
 
     train_generator = torch.Generator()
-    val_generator = torch.Generator()
+    val_generator = torch.Generator() if val_dataset is not None else None
     if generator_states is not None and generator_states.get("train") is not None:
         train_generator.set_state(generator_states["train"])
     else:
         train_generator.manual_seed(0)
-    if generator_states is not None and generator_states.get("val") is not None:
-        val_generator.set_state(generator_states["val"])
-    else:
-        val_generator.manual_seed(0)
+    if val_generator is not None:
+        if generator_states is not None and generator_states.get("val") is not None:
+            val_generator.set_state(generator_states["val"])
+        else:
+            val_generator.manual_seed(0)
 
     # Create dataloaders
 
@@ -536,26 +583,33 @@ def get_dataloaders(train_cfg, vlm_cfg, generator_states: dict | None = None):
         generator=train_generator,
     )
 
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=train_cfg.batch_size,
-        collate_fn=vqa_collator,
-        num_workers=1,
-        pin_memory=False,
-        persistent_workers=False,
-        drop_last=True,
-        worker_init_fn=seed_worker,
-        generator=val_generator,
-    )
+    val_loader = None
+    if val_dataset is not None:
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=train_cfg.batch_size,
+            collate_fn=vqa_collator,
+            num_workers=1,
+            pin_memory=False,
+            persistent_workers=False,
+            drop_last=True,
+            worker_init_fn=seed_worker,
+            generator=val_generator,
+        )
 
     # Warmup dataloaders to kickstart worker processes
     log_info("Warming up dataloaders...")
     warmup_train_iter = iter(train_loader)
-    warmup_val_iter = iter(val_loader)
     next(warmup_train_iter)
-    next(warmup_val_iter)
+    iter_val_loader = None
+    if val_loader is not None:
+        warmup_val_iter = iter(val_loader)
+        next(warmup_val_iter)
     iter_train_loader = iter(train_loader)
-    iter_val_loader = iter(val_loader)
+    if val_loader is not None:
+        iter_val_loader = iter(val_loader)
+    elif is_master():
+        log_warn("No validation dataset could be loaded. Validation will be skipped.")
     log_success("Warmup complete.")
 
     generators = {"train": train_generator, "val": val_generator}
@@ -847,13 +901,16 @@ def train(train_cfg, vlm_cfg, model_mode: str = "nanovlm"):
         )
         if is_dist():
             log_info(f"Training summary per GPU: batch size {ctext(train_loader.batch_size, 'cyan', attrs=('bold',))}")
-        log_info(
-            f"Validation summary{' (global)' if is_dist() else ''}: "
-            f"batch size {ctext(int(train_cfg.batch_size*get_world_size()*train_cfg.gradient_accumulation_steps), 'cyan', attrs=('bold',))}"
-            f"{', training on ' + str(get_world_size()) + ' GPUs' if is_dist() else ''}"
-        )
-        if is_dist():
-            log_info(f"Validation summary per GPU: batch size {ctext(val_loader.batch_size, 'cyan', attrs=('bold',))}")
+        if val_loader is not None:
+            log_info(
+                f"Validation summary{' (global)' if is_dist() else ''}: "
+                f"batch size {ctext(int(train_cfg.batch_size*get_world_size()*train_cfg.gradient_accumulation_steps), 'cyan', attrs=('bold',))}"
+                f"{', training on ' + str(get_world_size()) + ' GPUs' if is_dist() else ''}"
+            )
+            if is_dist():
+                log_info(f"Validation summary per GPU: batch size {ctext(val_loader.batch_size, 'cyan', attrs=('bold',))}")
+        else:
+            log_warn("Validation loader is disabled for this run.")
 
     # Define optimizer groups
     # Since we have pretrained vision and language backbones, but a newly initialized modality projection layer, it doesn't make sense to train them with the same learning rate
@@ -1073,7 +1130,11 @@ def train(train_cfg, vlm_cfg, model_mode: str = "nanovlm"):
         epoch_start_rng_state = _capture_rng_state()
         epoch_start_dataloader_generator_state = {
             "train": dataloader_generators["train"].get_state().clone(),
-            "val": dataloader_generators["val"].get_state().clone(),
+            "val": (
+                dataloader_generators["val"].get_state().clone()
+                if dataloader_generators.get("val") is not None
+                else None
+            ),
         }
         if pending_resume_skip > 0 and resume_epoch_target == epoch:
             if resume_epoch_start_rng_state is not None:
@@ -1263,6 +1324,8 @@ def train(train_cfg, vlm_cfg, model_mode: str = "nanovlm"):
             
             if (
                 train_cfg.eval_in_epochs
+                and val_loader is not None
+                and iter_val_loader is not None
                 and is_update_step
                 and step_after_update % train_cfg.eval_interval == 0
             ):
@@ -1378,11 +1441,19 @@ def train(train_cfg, vlm_cfg, model_mode: str = "nanovlm"):
                         "epoch_start_rng_state": epoch_start_rng_state,
                         "dataloader_generator_state": {
                             "train": dataloader_generators["train"].get_state().clone(),
-                            "val": dataloader_generators["val"].get_state().clone(),
+                            "val": (
+                                dataloader_generators["val"].get_state().clone()
+                                if dataloader_generators.get("val") is not None
+                                else None
+                            ),
                         },
                         "epoch_start_dataloader_generator_state": {
                             "train": epoch_start_dataloader_generator_state["train"].clone(),
-                            "val": epoch_start_dataloader_generator_state["val"].clone(),
+                            "val": (
+                                epoch_start_dataloader_generator_state["val"].clone()
+                                if epoch_start_dataloader_generator_state["val"] is not None
+                                else None
+                            ),
                         },
                     }
                     _upload_training_state_to_hub(
