@@ -114,11 +114,14 @@ vlm:
   left_mask_scope: full
   right_prefill_mode: full
   use_kv_bridge: true
-  kv_bridge_type: mlp
+  kv_bridge_type: residual_nonlinear
   kv_bridge_mlp_ratio: 4.0
   kv_bridge_use_rmsnorm: true
   kv_bridge_residual: true
   kv_bridge_init_mode: default
+  kv_bridge_linear_depth: 1
+  kv_bridge_adapter_depth: 2
+  kv_bridge_adapter_expansion: 1.0
 train:
   lr_mp: 5.0e-05
   lr_vision_backbone: 0
@@ -127,8 +130,8 @@ train:
   lr_right_tower: 0.0
   lr_kv_bridge: 0.0001
   val_size: 50000
-  batch_size: 8
-  gradient_accumulation_steps: 16
+  batch_size: 16
+  gradient_accumulation_steps: 8
   max_grad_norm: 1.0
   eval_in_epochs: false
   eval_interval: 500
@@ -148,8 +151,6 @@ train:
   train_split: train
   val_split: validation
   stream_dataset: false
-  enable_source_filter: false
-  allowed_dataset_sources: []
   relevance_min_rating: 1
   image_correspondence_min_rating: 1
   visual_dependency_min_rating: 1
@@ -162,6 +163,6 @@ train:
   lmms_eval_batch_size: 64
   push_checkpoints_to_hub: true
   save_training_state_to_hub: true
-  checkpoint_repo_pattern: patrickamadeus/dualtower-full-step-{i}
+  checkpoint_repo_pattern: patrickamadeus/dualbridge-full-step-{i}
   hf_private: false
   push_final_model_to_hub: false

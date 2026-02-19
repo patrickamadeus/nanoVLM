@@ -82,6 +82,57 @@ class HeadDimRMSNorm(nn.Module):
         return x * inv_rms * self.weight
 
 
+def init_diag_eye_(w: torch.Tensor) -> None:
+    with torch.no_grad():
+        w.zero_()
+        diag_len = min(w.size(0), w.size(1))
+        idx = torch.arange(diag_len, device=w.device)
+        w[idx, idx] = 1.0
+
+
+class AffineTransformer(nn.Module):
+    def __init__(self, dim: int, *, depth: int = 1):
+        super().__init__()
+        depth = max(1, int(depth))
+        self.layers = nn.ModuleList([nn.Linear(dim, dim, bias=False) for _ in range(depth)])
+        for layer in self.layers:
+            init_diag_eye_(layer.weight)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        for layer in self.layers:
+            x = layer(x)
+        return x
+
+
+class ResidualAdapter(nn.Module):
+    def __init__(self, dim: int, *, depth: int = 2, expansion: float = 1.0):
+        super().__init__()
+        depth = max(2, int(depth))
+        hidden = max(1, int(round(dim * float(expansion))))
+
+        self.in_proj = nn.Linear(dim, hidden, bias=False)
+        self.hidden = nn.ModuleList([nn.Linear(hidden, hidden, bias=False) for _ in range(depth - 2)])
+        self.out_proj = nn.Linear(hidden, dim, bias=False)
+
+        with torch.no_grad():
+            if self.in_proj.weight.shape[0] == self.in_proj.weight.shape[1]:
+                init_diag_eye_(self.in_proj.weight)
+            else:
+                nn.init.normal_(self.in_proj.weight, mean=0.0, std=0.02)
+
+            for layer in self.hidden:
+                init_diag_eye_(layer.weight)
+
+            # f(x)=0 at init => residual path starts as exact identity.
+            nn.init.zeros_(self.out_proj.weight)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = F.silu(self.in_proj(x))
+        for layer in self.hidden:
+            h = F.silu(layer(h))
+        return self.out_proj(h)
+
+
 class KVBridgeLayer(nn.Module):
     def __init__(
         self,
@@ -92,6 +143,9 @@ class KVBridgeLayer(nn.Module):
         use_rmsnorm: bool,
         residual: bool,
         init_mode: str,
+        linear_depth: int,
+        adapter_depth: int,
+        adapter_expansion: float,
     ):
         super().__init__()
         self.bridge_type = bridge_type
@@ -115,17 +169,39 @@ class KVBridgeLayer(nn.Module):
             self.k_fc2 = nn.Linear(hidden_dim, head_dim, bias=False)
             self.v_fc1 = nn.Linear(head_dim, hidden_dim, bias=False)
             self.v_fc2 = nn.Linear(hidden_dim, head_dim, bias=False)
+        elif bridge_type == "scaled_linear":
+            self.key_transform = AffineTransformer(head_dim, depth=linear_depth)
+            self.value_transform = AffineTransformer(head_dim, depth=linear_depth)
+            self.key_scale = nn.Parameter(torch.ones(head_dim))
+            self.value_scale = nn.Parameter(torch.ones(head_dim))
+        elif bridge_type == "residual_nonlinear":
+            self.key_adapter = ResidualAdapter(
+                head_dim,
+                depth=adapter_depth,
+                expansion=adapter_expansion,
+            )
+            self.value_adapter = ResidualAdapter(
+                head_dim,
+                depth=adapter_depth,
+                expansion=adapter_expansion,
+            )
+            self.key_scale = nn.Parameter(torch.ones(head_dim))
+            self.value_scale = nn.Parameter(torch.ones(head_dim))
         else:
-            raise ValueError(f"Unsupported kv_bridge_type={bridge_type!r}. Expected one of ['linear', 'mlp']")
+            raise ValueError(
+                f"Unsupported kv_bridge_type={bridge_type!r}. "
+                "Expected one of ['linear', 'mlp', 'scaled_linear', 'residual_nonlinear']"
+            )
 
-        self._init_bridge_parameters()
+        if bridge_type in {"linear", "mlp"}:
+            self._init_legacy_bridge_parameters()
 
     def _fill_diag_eye(self, weight: torch.Tensor) -> None:
         weight.zero_()
         diag_len = min(weight.size(0), weight.size(1))
         weight[torch.arange(diag_len), torch.arange(diag_len)] = 1.0
 
-    def _init_bridge_parameters(self) -> None:
+    def _init_legacy_bridge_parameters(self) -> None:
         if self.init_mode not in {"default", "normal", "diag_eye"}:
             raise ValueError(
                 f"Unsupported kv_bridge_init_mode={self.init_mode!r}. "
@@ -167,6 +243,16 @@ class KVBridgeLayer(nn.Module):
                     self._fill_diag_eye(self.v_fc2.weight)
 
     def _project(self, x: torch.Tensor, is_key: bool) -> torch.Tensor:
+        if self.bridge_type == "scaled_linear":
+            if is_key:
+                return self.key_transform(x) * self.key_scale
+            return self.value_transform(x) * self.value_scale
+
+        if self.bridge_type == "residual_nonlinear":
+            if is_key:
+                return (x + self.key_adapter(x)) * self.key_scale
+            return (x + self.value_adapter(x)) * self.value_scale
+
         if self.bridge_type == "linear":
             return self.k_proj(x) if is_key else self.v_proj(x)
 
@@ -181,6 +267,9 @@ class KVBridgeLayer(nn.Module):
         k_out = self._project(k_in, is_key=True)
         v_out = self._project(v_in, is_key=False)
 
+        if self.bridge_type in {"scaled_linear", "residual_nonlinear"}:
+            return k_out, v_out
+
         if self.residual:
             return k + k_out, v + v_out
         return k_out, v_out
@@ -190,8 +279,12 @@ class KVCacheBridge(nn.Module):
     def __init__(self, cfg: VLMConfig):
         super().__init__()
         bridge_type = getattr(cfg, "kv_bridge_type", "linear")
-        if bridge_type not in {"linear", "mlp"}:
-            raise ValueError(f"Unsupported kv_bridge_type={bridge_type!r}. Expected one of ['linear', 'mlp']")
+        valid_bridge_types = {"linear", "mlp", "scaled_linear", "residual_nonlinear"}
+        if bridge_type not in valid_bridge_types:
+            raise ValueError(
+                f"Unsupported kv_bridge_type={bridge_type!r}. "
+                f"Expected one of {sorted(valid_bridge_types)}"
+            )
 
         head_dim = cfg.lm_hidden_dim // cfg.lm_n_heads
         self.layers = nn.ModuleList([
@@ -202,6 +295,9 @@ class KVCacheBridge(nn.Module):
                 use_rmsnorm=getattr(cfg, "kv_bridge_use_rmsnorm", True),
                 residual=getattr(cfg, "kv_bridge_residual", True),
                 init_mode=getattr(cfg, "kv_bridge_init_mode", "default"),
+                linear_depth=getattr(cfg, "kv_bridge_linear_depth", 1),
+                adapter_depth=getattr(cfg, "kv_bridge_adapter_depth", 2),
+                adapter_expansion=getattr(cfg, "kv_bridge_adapter_expansion", 1.0),
             )
             for _ in range(cfg.lm_n_blocks)
         ])

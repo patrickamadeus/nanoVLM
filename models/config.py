@@ -56,11 +56,14 @@ class VLMConfig:
     left_mask_scope: str = "full"  # visual_only | visual_sys | full
     right_prefill_mode: str = "full"  # full | non_donor_only (generation only)
     use_kv_bridge: bool = True
-    kv_bridge_type: str = "mlp"  # linear | mlp
+    kv_bridge_type: str = "mlp"  # linear | mlp | scaled_linear | residual_nonlinear
     kv_bridge_mlp_ratio: float = 4.0
     kv_bridge_use_rmsnorm: bool = True
     kv_bridge_residual: bool = True
     kv_bridge_init_mode: str = "default"  # default | normal | diag_eye
+    kv_bridge_linear_depth: int = 1
+    kv_bridge_adapter_depth: int = 2
+    kv_bridge_adapter_expansion: float = 1.0
 
 
 @dataclass
@@ -93,6 +96,8 @@ class TrainConfig:
     train_split: str = "train"
     val_split: str = "validation"
     stream_dataset: bool = False
+    enable_source_filter: bool = False
+    allowed_dataset_sources: tuple[str, ...] = ()
     relevance_min_rating: int = 1
     image_correspondence_min_rating: int = 1
     visual_dependency_min_rating: int = 1

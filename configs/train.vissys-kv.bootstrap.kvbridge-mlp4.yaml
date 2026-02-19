@@ -112,7 +112,7 @@ vlm:
   vlm_checkpoint_path: lusxvr/nanoVLM-230M-8k
   hf_repo_name: nanoVLM
   left_mask_scope: full
-  right_prefill_mode: full
+  right_prefill_mode: non_donor_only
   use_kv_bridge: true
   kv_bridge_type: mlp
   kv_bridge_mlp_ratio: 4.0
@@ -148,8 +148,6 @@ train:
   train_split: train
   val_split: validation
   stream_dataset: false
-  enable_source_filter: false
-  allowed_dataset_sources: []
   relevance_min_rating: 1
   image_correspondence_min_rating: 1
   visual_dependency_min_rating: 1
@@ -162,6 +160,6 @@ train:
   lmms_eval_batch_size: 64
   push_checkpoints_to_hub: true
   save_training_state_to_hub: true
-  checkpoint_repo_pattern: patrickamadeus/dualtower-full-step-{i}
+  checkpoint_repo_pattern: patrickamadeus/dualtower-vissys-kv-bootstrap-kvbridge-step-{i}
   hf_private: false
   push_final_model_to_hub: false

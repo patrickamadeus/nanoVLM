@@ -1,6 +1,7 @@
 import os
 import math
 import time
+import re
 import textwrap
 import tempfile
 import torch
@@ -250,7 +251,7 @@ def _apply_yaml_train_overrides(config_path: str, vlm_cfg, train_cfg):
         train_cfg,
         train_overrides,
         object_name="TrainConfig",
-        tuple_fields={"train_dataset_name"},
+        tuple_fields={"train_dataset_name", "allowed_dataset_sources"},
     )
 
     if mode is not None and mode not in {"nanovlm", "dualtower"}:
@@ -267,6 +268,113 @@ def _combine_split_datasets(datasets_to_combine, stream_dataset):
         return interleave_datasets(datasets_to_combine, stopping_strategy="all_exhausted")
     return concatenate_datasets(datasets_to_combine)
 
+def _normalize_source_name(source_name: str) -> str:
+    normalized = source_name.strip().lower()
+    normalized = re.sub(r"[\s\-\/]+", "_", normalized)
+    normalized = re.sub(r"_+", "_", normalized)
+    return normalized.strip("_")
+
+def _get_example_num_images(example):
+    num_imgs = example.get("num_imgs", None)
+    if isinstance(num_imgs, int):
+        return num_imgs
+    if isinstance(num_imgs, float):
+        return int(num_imgs)
+
+    images = example.get("images", None)
+    if images is None:
+        return 0
+    if isinstance(images, list):
+        return len(images)
+    return 1
+
+def _apply_runtime_dataset_filters(ds, train_cfg, dataset_name, split_name):
+    use_source_filter = train_cfg.enable_source_filter
+    max_images = train_cfg.max_images_per_example
+    use_max_images_filter = max_images is not None
+    if not use_source_filter and not use_max_images_filter:
+        return ds
+
+    allowed_sources = None
+    if use_source_filter:
+        if not train_cfg.allowed_dataset_sources:
+            if is_master():
+                log_warn("Source filtering is enabled, but allowed_dataset_sources is empty. Source filtering is skipped.")
+            use_source_filter = False
+        else:
+            allowed_sources = {_normalize_source_name(src) for src in train_cfg.allowed_dataset_sources}
+
+    column_names = getattr(ds, "column_names", None)
+    if column_names is not None:
+        if use_source_filter and "source" not in column_names:
+            if is_master():
+                log_warn(
+                    f"Dataset '{dataset_name}' split '{split_name}' has no 'source' column. "
+                    "Source filtering is skipped."
+                )
+            use_source_filter = False
+
+        if use_max_images_filter and "num_imgs" not in column_names and "images" not in column_names:
+            if is_master():
+                log_warn(
+                    f"Dataset '{dataset_name}' split '{split_name}' has neither 'num_imgs' nor 'images' columns. "
+                    "Max-images filtering is skipped."
+                )
+            use_max_images_filter = False
+
+    if not use_source_filter and not use_max_images_filter:
+        return ds
+
+    def _keep_example(example):
+        if use_source_filter:
+            source_value = example.get("source", None)
+            if source_value is None:
+                return False
+            if isinstance(source_value, str):
+                source_ok = _normalize_source_name(source_value) in allowed_sources
+            elif isinstance(source_value, list):
+                source_ok = any(
+                    _normalize_source_name(str(v)) in allowed_sources
+                    for v in source_value
+                    if v is not None
+                )
+            else:
+                source_ok = _normalize_source_name(str(source_value)) in allowed_sources
+            if not source_ok:
+                return False
+
+        if use_max_images_filter:
+            if _get_example_num_images(example) > max_images:
+                return False
+
+        return True
+
+    filter_tags = []
+    if use_source_filter:
+        filter_tags.append("source")
+    if use_max_images_filter:
+        filter_tags.append(f"max_images<={max_images}")
+    filter_tag_str = "+".join(filter_tags)
+
+    if train_cfg.stream_dataset:
+        ds = ds.filter(_keep_example)
+        if is_master():
+            log_info(
+                f"Applied streaming runtime filters [{filter_tag_str}] to {dataset_name}:{split_name} "
+                "(size unknown in streaming mode)."
+            )
+        return ds
+
+    before_len = len(ds)
+    ds = ds.filter(_keep_example, desc=f"Filtering {dataset_name}:{split_name} by {filter_tag_str}")
+    after_len = len(ds)
+    if is_master():
+        log_info(
+            f"Runtime filters [{filter_tag_str}] on {dataset_name}:{split_name} kept "
+            f"{ctext(str(after_len), 'cyan', attrs=('bold',))}/{ctext(str(before_len), 'cyan', attrs=('bold',))} rows."
+        )
+    return ds
+
 def _load_dataset_split(train_cfg, dataset_name, split_name):
     if "shard_" in dataset_name:
         ds = load_from_disk(dataset_name)
@@ -281,6 +389,7 @@ def _load_dataset_split(train_cfg, dataset_name, split_name):
         streaming=train_cfg.stream_dataset,
         on_bad_files='warn',
     )
+    ds = _apply_runtime_dataset_filters(ds, train_cfg, dataset_name, split_name)
     return ds
 
 def get_dataloaders(train_cfg, vlm_cfg, generator_states: dict | None = None):
@@ -419,7 +528,7 @@ def get_dataloaders(train_cfg, vlm_cfg, generator_states: dict | None = None):
         train_dataset,
         batch_size=train_cfg.batch_size,    # =per device BS in DDP
         collate_fn=vqa_collator,
-        num_workers=2,
+        num_workers=1,
         pin_memory=False,
         persistent_workers=False,
         drop_last=True,
@@ -431,7 +540,7 @@ def get_dataloaders(train_cfg, vlm_cfg, generator_states: dict | None = None):
         val_dataset,
         batch_size=train_cfg.batch_size,
         collate_fn=vqa_collator,
-        num_workers=2,
+        num_workers=1,
         pin_memory=False,
         persistent_workers=False,
         drop_last=True,
@@ -454,7 +563,7 @@ def get_dataloaders(train_cfg, vlm_cfg, generator_states: dict | None = None):
 
 # Cosine learning rate schedule with warmup (from Karpathy)
 # https://github.com/karpathy/build-nanogpt/blob/master/train_gpt2.py#L353
-def get_lr(it, max_lr, max_steps, warmup_ratio=0.03):
+def get_lr(it, max_lr, max_steps, warmup_ratio=0.01):
     if max_steps <= 0:
         raise ValueError("max_steps must be > 0 for LR schedule.")
     if not (0.0 <= warmup_ratio < 1.0):
@@ -1171,7 +1280,7 @@ def train(train_cfg, vlm_cfg, model_mode: str = "nanovlm"):
                     should_log_val_decode = (step_after_update % VAL_DEBUG_SAMPLE_INTERVAL == 0)
                     logged_val_decode = False
                     for batch in synchronized_dataloader_step(iter_val_loader, is_dist()):
-                        if val_batches > 64:
+                        if val_batches > 100:
                             log_info(f"Evaluated {ctext(val_batches, 'cyan', attrs=('bold',))} validation batches")
                             break
                         images = batch["images"]
@@ -1525,6 +1634,11 @@ def main():
     parser.add_argument('--no_log_wandb', action='store_true', help='Do not log to wandb')
     parser.add_argument('--train_dataset_path', type=str, help='Train dataset path')
     parser.add_argument('--train_dataset_name', nargs='+', type=str, help='Dataset config names to load (use "default" for single-config datasets)')
+    parser.add_argument('--allowed_dataset_sources', nargs='+', type=str, help='Allowlist of source values to keep (normalized at runtime).')
+    source_filter_group = parser.add_mutually_exclusive_group()
+    source_filter_group.add_argument('--source_filter', dest='enable_source_filter', action='store_true', help='Enable runtime filtering by source column.')
+    source_filter_group.add_argument('--no_source_filter', dest='enable_source_filter', action='store_false', help='Disable runtime filtering by source column.')
+    parser.set_defaults(enable_source_filter=None)
     parser.add_argument('--train_split', type=str, help='Dataset split name for training data')
     parser.add_argument('--val_split', type=str, help='Dataset split name for validation data')
     parser.add_argument('--checkpoint_interval', type=int, help='Push checkpoint to hub every N optimizer steps')
@@ -1594,6 +1708,10 @@ def main():
         train_cfg.train_dataset_path = args.train_dataset_path
     if args.train_dataset_name is not None:
         train_cfg.train_dataset_name = tuple(args.train_dataset_name)
+    if args.allowed_dataset_sources is not None:
+        train_cfg.allowed_dataset_sources = tuple(args.allowed_dataset_sources)
+    if args.enable_source_filter is not None:
+        train_cfg.enable_source_filter = args.enable_source_filter
     if args.train_split is not None:
         train_cfg.train_split = args.train_split
     if args.val_split is not None:

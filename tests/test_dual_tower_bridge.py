@@ -68,6 +68,28 @@ class TestKVCacheBridge(unittest.TestCase):
         grads = [p.grad for p in bridge.parameters() if p.requires_grad]
         self.assertTrue(any(g is not None for g in grads))
 
+    def test_scaled_linear_is_identity_initialized_without_rmsnorm(self):
+        cfg = self._build_cfg("scaled_linear", residual=False, use_rmsnorm=False)
+        bridge = KVCacheBridge(cfg)
+        kv_cache = self._build_cache()
+        original = copy.deepcopy(kv_cache)
+
+        bridged = bridge(kv_cache)
+        for old_layer, new_layer in zip(original, bridged):
+            self.assertTrue(torch.allclose(old_layer["key"], new_layer["key"]))
+            self.assertTrue(torch.allclose(old_layer["value"], new_layer["value"]))
+
+    def test_residual_nonlinear_is_identity_initialized_without_rmsnorm(self):
+        cfg = self._build_cfg("residual_nonlinear", residual=True, use_rmsnorm=False)
+        bridge = KVCacheBridge(cfg)
+        kv_cache = self._build_cache()
+        original = copy.deepcopy(kv_cache)
+
+        bridged = bridge(kv_cache)
+        for old_layer, new_layer in zip(original, bridged):
+            self.assertTrue(torch.allclose(old_layer["key"], new_layer["key"]))
+            self.assertTrue(torch.allclose(old_layer["value"], new_layer["value"]))
+
 
 if __name__ == "__main__":
     unittest.main()
