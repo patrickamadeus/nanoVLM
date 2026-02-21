@@ -14,7 +14,7 @@ vlm:
   lm_inter_dim: 1536
   lm_rms_eps: 1.0e-05
   lm_re_base: 100000
-  lm_max_position_embeddings: 2048
+  lm_max_position_embeddings: 4096
   lm_base_vocab_size: 49152
   extra_token_amount: 66
   lm_vocab_size: 49218
@@ -24,7 +24,7 @@ vlm:
   lm_n_blocks: 30
   lm_attn_scaling: 1.0
   lm_pad_aware_rope: false
-  lm_max_length: 2048
+  lm_max_length: 4096
   lm_use_tokens: false
   lm_tie_weights: true
   lm_model_type: HuggingFaceTB/SmolLM2-135M-Instruct
@@ -127,18 +127,18 @@ train:
   lr_right_tower: 0.0
   lr_kv_bridge: null
   val_size: 50000
-  batch_size: 8
-  gradient_accumulation_steps: 16
+  batch_size: 16
+  gradient_accumulation_steps: 8
   max_grad_norm: 1.0
   eval_in_epochs: false
   eval_interval: 500
   checkpoint_interval: 200
   stats_log_interval: 100
-  max_training_steps: 50000
+  max_training_steps: 30000
   warmup_ratio: 0.01
-  max_images_per_example: 1
+  max_images_per_example: 5
   max_images_per_knapsack: 18
-  max_sample_length: 2048
+  max_sample_length: 4096
   use_packing: true
   compile: true
   resume_from_vlm_checkpoint: true
