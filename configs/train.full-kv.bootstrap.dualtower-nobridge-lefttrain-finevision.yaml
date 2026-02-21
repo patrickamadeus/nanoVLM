@@ -127,7 +127,7 @@ train:
   lr_right_tower: 0.0
   lr_kv_bridge: null
   val_size: 50000
-  batch_size: 16
+  batch_size: 4
   gradient_accumulation_steps: 8
   max_grad_norm: 1.0
   eval_in_epochs: false
@@ -140,7 +140,7 @@ train:
   max_images_per_knapsack: 18
   max_sample_length: 4096
   use_packing: true
-  compile: true
+  compile: false
   resume_from_vlm_checkpoint: true
   train_dataset_path: HuggingFaceM4/FineVisionMax
   train_dataset_name: []

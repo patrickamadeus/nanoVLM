@@ -108,7 +108,7 @@ def dist_mean_scalar(x: float | int) -> float:
 
 def wrap_model(model):
     local_rank = int(os.environ["LOCAL_RANK"])
-    return DistributedDataParallel(model, device_ids=[local_rank], output_device=local_rank)
+    return DistributedDataParallel(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True)
 
 def get_run_name(train_cfg, vlm_cfg):
     batch_size = f"bs{int(train_cfg.batch_size*get_world_size()*train_cfg.gradient_accumulation_steps)}"
@@ -575,9 +575,9 @@ def get_dataloaders(train_cfg, vlm_cfg, generator_states: dict | None = None):
         train_dataset,
         batch_size=train_cfg.batch_size,    # =per device BS in DDP
         collate_fn=vqa_collator,
-        num_workers=1,
-        pin_memory=False,
-        persistent_workers=False,
+        num_workers=4,
+        pin_memory=True,
+        persistent_workers=True,
         drop_last=True,
         worker_init_fn=seed_worker,
         generator=train_generator,
@@ -1030,7 +1030,7 @@ def train(train_cfg, vlm_cfg, model_mode: str = "nanovlm"):
     model.to(device)
     
     if train_cfg.compile:
-        model = torch.compile(model)
+        model = torch.compile(model, dynamic=True)
     if is_dist():
         log_info("Wrapping model for DDP")
         model = wrap_model(model)
