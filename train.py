@@ -148,6 +148,13 @@ def get_optimizer_lrs(optimizer, train_cfg):
         and param_group_idx < len(optimizer.param_groups)
     ):
         lrs["lr_kv_bridge"] = optimizer.param_groups[param_group_idx]["lr"]
+        param_group_idx += 1
+    if (
+        train_cfg.lr_attn_gate is not None
+        and train_cfg.lr_attn_gate > 0
+        and param_group_idx < len(optimizer.param_groups)
+    ):
+        lrs["lr_attn_gate"] = optimizer.param_groups[param_group_idx]["lr"]
     return lrs
 
 
@@ -424,7 +431,7 @@ def get_dataloaders(train_cfg, vlm_cfg, generator_states: dict | None = None):
         dataset_names_to_load = [train_cfg.train_dataset_path + f"/shard_{i}" for i in range(total_shards)]
         use_subset_names = True
 
-    if use_subset_names and any(name in {"_all_", "all"} for name in dataset_names_to_load):
+    if use_subset_names and any(name in {"_all_"} for name in dataset_names_to_load):
         dataset_names_to_load = get_dataset_config_names(train_cfg.train_dataset_path)
         if not dataset_names_to_load:
             raise ValueError(
@@ -826,7 +833,22 @@ def train(train_cfg, vlm_cfg, model_mode: str = "nanovlm"):
                 )
                 model.left_tower.vision_encoder.load_state_dict(vlm_model.vision_encoder.state_dict())
                 model.left_tower.MP.load_state_dict(vlm_model.MP.state_dict())
-                model.left_tower.decoder.load_state_dict(vlm_model.decoder.state_dict())
+                left_decoder_sd = model.left_tower.decoder.state_dict()
+                vlm_decoder_sd = vlm_model.decoder.state_dict()
+                copied_keys = 0
+                skipped_keys = []
+                for key, tensor in vlm_decoder_sd.items():
+                    if key in left_decoder_sd and left_decoder_sd[key].shape == tensor.shape:
+                        left_decoder_sd[key].copy_(tensor)
+                        copied_keys += 1
+                    else:
+                        skipped_keys.append(key)
+                model.left_tower.decoder.load_state_dict(left_decoder_sd, strict=False)
+                if skipped_keys:
+                    log_warn(
+                        "Loaded left decoder with shape filtering: "
+                        f"copied={copied_keys}, skipped={len(skipped_keys)}"
+                    )
                 right_lm = LanguageModel.from_pretrained(vlm_cfg)
                 model.right_tower.load_state_dict(right_lm.state_dict())
                 del right_lm
@@ -931,12 +953,23 @@ def train(train_cfg, vlm_cfg, model_mode: str = "nanovlm"):
         if train_cfg.lr_kv_bridge is not None
         else train_cfg.lr_language_backbone
     )
+    attn_gate_lr = (
+        train_cfg.lr_attn_gate
+        if train_cfg.lr_attn_gate is not None
+        else kv_bridge_lr
+    )
 
     mp_module = model.left_tower.MP if model_mode == "dualtower" and hasattr(model, "left_tower") else model.MP
     vision_module = model.left_tower.vision_encoder if model_mode == "dualtower" and hasattr(model, "left_tower") else model.vision_encoder
 
     if model_mode == "dualtower" and hasattr(model, "left_tower") and hasattr(model, "right_tower"):
         kv_bridge_module = getattr(model, "kv_bridge", None)
+        right_attn_gate_params = (
+            list(model.right_tower.attn_gate_parameters())
+            if hasattr(model.right_tower, "attn_gate_parameters")
+            else []
+        )
+        right_attn_gate_params = list({id(p): p for p in right_attn_gate_params}.values())
         bridge_only_mode = bool(getattr(vlm_cfg, "use_kv_bridge", False))
 
         if bridge_only_mode:
@@ -950,7 +983,18 @@ def train(train_cfg, vlm_cfg, model_mode: str = "nanovlm"):
             for p in kv_bridge_module.parameters():
                 p.requires_grad = True
 
-            param_groups.append({'name': 'lr_kv_bridge', 'params': list(kv_bridge_module.parameters()), 'lr': kv_bridge_lr})
+            bridge_params = list({id(p): p for p in kv_bridge_module.parameters()}.values())
+            if bridge_params:
+                param_groups.append({'name': 'lr_kv_bridge', 'params': bridge_params, 'lr': kv_bridge_lr})
+
+            if right_attn_gate_params:
+                if attn_gate_lr is not None and attn_gate_lr > 0:
+                    for p in right_attn_gate_params:
+                        p.requires_grad = True
+                    param_groups.append({'name': 'lr_attn_gate', 'params': right_attn_gate_params, 'lr': attn_gate_lr})
+                else:
+                    for p in right_attn_gate_params:
+                        p.requires_grad = False
         else:
             if train_cfg.lr_mp > 0:
                 param_groups.append({'name': 'lr_mp', 'params': list(mp_module.parameters()), 'lr': train_cfg.lr_mp})
@@ -970,17 +1014,45 @@ def train(train_cfg, vlm_cfg, model_mode: str = "nanovlm"):
                 for p in list(model.left_tower.decoder.parameters()):
                     p.requires_grad = False
 
+            right_tower_frozen = False
+            gate_param_ids = {id(p) for p in right_attn_gate_params}
+            split_gate_lr = train_cfg.lr_attn_gate is not None and bool(right_attn_gate_params)
             if dual_right_lr > 0:
-                param_groups.append({'name': 'lr_right_tower', 'params': list(model.right_tower.parameters()), 'lr': dual_right_lr})
+                if split_gate_lr:
+                    right_non_gate_params = [p for p in model.right_tower.parameters() if id(p) not in gate_param_ids]
+                    if right_non_gate_params:
+                        param_groups.append({'name': 'lr_right_tower', 'params': right_non_gate_params, 'lr': dual_right_lr})
+                    if attn_gate_lr is not None and attn_gate_lr > 0:
+                        for p in right_attn_gate_params:
+                            p.requires_grad = True
+                        param_groups.append({'name': 'lr_attn_gate', 'params': right_attn_gate_params, 'lr': attn_gate_lr})
+                    else:
+                        for p in right_attn_gate_params:
+                            p.requires_grad = False
+                else:
+                    param_groups.append({'name': 'lr_right_tower', 'params': list(model.right_tower.parameters()), 'lr': dual_right_lr})
             else:
+                right_tower_frozen = True
                 for p in list(model.right_tower.parameters()):
                     p.requires_grad = False
 
             if kv_bridge_module is not None:
                 if kv_bridge_lr is not None and kv_bridge_lr > 0:
-                    param_groups.append({'name': 'lr_kv_bridge', 'params': list(kv_bridge_module.parameters()), 'lr': kv_bridge_lr})
+                    bridge_params = list({id(p): p for p in kv_bridge_module.parameters()}.values())
+                    if bridge_params:
+                        param_groups.append({'name': 'lr_kv_bridge', 'params': bridge_params, 'lr': kv_bridge_lr})
                 else:
                     for p in list(kv_bridge_module.parameters()):
+                        p.requires_grad = False
+
+            # Allow gate-only training even when use_kv_bridge=False and right tower is frozen.
+            if right_tower_frozen and right_attn_gate_params:
+                if attn_gate_lr is not None and attn_gate_lr > 0:
+                    for p in right_attn_gate_params:
+                        p.requires_grad = True
+                    param_groups.append({'name': 'lr_attn_gate', 'params': right_attn_gate_params, 'lr': attn_gate_lr})
+                else:
+                    for p in right_attn_gate_params:
                         p.requires_grad = False
     else:
         if train_cfg.lr_mp > 0:
@@ -1280,6 +1352,16 @@ def train(train_cfg, vlm_cfg, model_mode: str = "nanovlm"):
                             if train_cfg.lr_kv_bridge is not None
                             else train_cfg.lr_language_backbone
                         )
+                    elif group_name == "lr_attn_gate":
+                        max_lr = (
+                            train_cfg.lr_attn_gate
+                            if train_cfg.lr_attn_gate is not None
+                            else (
+                                train_cfg.lr_kv_bridge
+                                if train_cfg.lr_kv_bridge is not None
+                                else train_cfg.lr_language_backbone
+                            )
+                        )
 
                     if max_lr is not None and max_lr > 0:
                         group['lr'] = get_lr(
@@ -1542,6 +1624,7 @@ def train(train_cfg, vlm_cfg, model_mode: str = "nanovlm"):
                         f"lr_left={stats.get('lr_left_tower', 0.0):.6g} "
                         f"lr_right={stats.get('lr_right_tower', 0.0):.6g} "
                         f"lr_bridge={stats.get('lr_kv_bridge', 0.0):.6g} "
+                        f"lr_gate={stats.get('lr_attn_gate', 0.0):.6g} "
                         + (f"grad_norm={stats['grad_norm']:.4f}" if 'grad_norm' in stats else "")
                     )
                 
@@ -1680,6 +1763,7 @@ def main():
     parser.add_argument('--lr_left_tower', type=float, help='DualTower: learning rate for the left tower language decoder')
     parser.add_argument('--lr_right_tower', type=float, help='DualTower: learning rate for the right tower')
     parser.add_argument('--lr_kv_bridge', type=float, help='DualTower: learning rate for KV bridge module')
+    parser.add_argument('--lr_attn_gate', type=float, help='DualTower: learning rate for right attention gating parameters')
     parser.add_argument('--vlm_checkpoint_path', type=str, help='Path or repo ID of the VLM checkpoint for loading')
     parser.add_argument(
         '--left_mask_scope',
@@ -1751,6 +1835,8 @@ def main():
         train_cfg.lr_right_tower = args.lr_right_tower
     if args.lr_kv_bridge is not None:
         train_cfg.lr_kv_bridge = args.lr_kv_bridge
+    if args.lr_attn_gate is not None:
+        train_cfg.lr_attn_gate = args.lr_attn_gate
     if args.vlm_checkpoint_path is not None:
         vlm_cfg.vlm_checkpoint_path = args.vlm_checkpoint_path
     if args.left_mask_scope is not None:

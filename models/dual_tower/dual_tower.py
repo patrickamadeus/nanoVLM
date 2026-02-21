@@ -4,7 +4,8 @@ import torch.nn.functional as F
 import json
 import os
 import tempfile
-from dataclasses import asdict
+import copy
+from dataclasses import asdict, fields
 from safetensors.torch import load_model as load_safetensors, save_model
 from models.language_model import LanguageModel
 from models.vision_language_model import VisionLanguageModel
@@ -337,8 +338,11 @@ class DualTowerVLM(nn.Module):
     ):
         super().__init__()
         self.cfg = cfg
+        left_cfg = copy.deepcopy(cfg)
+        left_cfg.right_attn_gate_mode = "none"
+
         self.left_tower = LeftTower(
-            cfg,
+            left_cfg,
             load_backbone=load_backbone,
             freeze_vision_encoder=freeze_left_vision,
             freeze_modality_projector=freeze_left_projector,
@@ -380,6 +384,11 @@ class DualTowerVLM(nn.Module):
     @staticmethod
     def _mark_query_only(kv_cache: list[dict]) -> None:
         for layer_cache in kv_cache:
+            replace_mask = layer_cache.get("replace_mask")
+            if replace_mask is None:
+                replace_mask = layer_cache.get("img_mask")
+            if replace_mask is not None:
+                layer_cache["donor_key_mask"] = replace_mask.to(torch.bool)
             layer_cache["query_only"] = True
             layer_cache["needs_dual_prefill"] = False
             layer_cache.pop("replace_mask", None)
@@ -443,6 +452,7 @@ class DualTowerVLM(nn.Module):
         replace_mask = self._build_scope_mask(input_ids, attention_mask)
         for layer_cache in kv_cache:
             layer_cache["replace_mask"] = replace_mask
+            layer_cache["donor_key_mask"] = replace_mask.to(torch.bool)
             layer_cache["needs_dual_prefill"] = True
         return kv_cache
 
@@ -846,7 +856,12 @@ class DualTowerVLM(nn.Module):
 
         with open(resolved_config_path, "r") as f:
             cfg_dict = json.load(f)
-        cfg = VLMConfig(**cfg_dict)
+        known_fields = {field_.name for field_ in fields(VLMConfig)}
+        filtered_cfg = {k: v for k, v in cfg_dict.items() if k in known_fields}
+        unknown_cfg_keys = sorted(k for k in cfg_dict if k not in known_fields)
+        if unknown_cfg_keys:
+            print(f"Warning: Ignoring unknown VLMConfig fields from checkpoint: {unknown_cfg_keys}")
+        cfg = VLMConfig(**filtered_cfg)
 
         model = cls(cfg, load_backbone=load_backbone, **model_kwargs)
         load_safetensors(model, weights_path)

@@ -1,7 +1,7 @@
 import json
 import os
 import tempfile
-from dataclasses import asdict
+from dataclasses import asdict, fields
 from typing import Optional
 
 
@@ -269,9 +269,15 @@ class VisionLanguageModel(nn.Module):
                 repo_id=repo_id_or_path, filename="model.safetensors", revision=revision
             )
 
-        # Load config
+        # Load config (tolerate stale/unknown keys from older checkpoints).
         with open(config_path, "r") as f:
-            cfg = VLMConfig(**json.load(f))
+            raw_cfg = json.load(f)
+        known_fields = {field_.name for field_ in fields(VLMConfig)}
+        filtered_cfg = {k: v for k, v in raw_cfg.items() if k in known_fields}
+        unknown_cfg_keys = sorted(k for k in raw_cfg if k not in known_fields)
+        if unknown_cfg_keys:
+            print(f"Warning: Ignoring unknown VLMConfig fields from checkpoint: {unknown_cfg_keys}")
+        cfg = VLMConfig(**filtered_cfg)
 
         # Initialize model without loading the backbone
         model = cls(cfg, load_backbone=False)

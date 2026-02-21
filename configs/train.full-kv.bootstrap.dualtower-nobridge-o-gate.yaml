@@ -14,7 +14,7 @@ vlm:
   lm_inter_dim: 1536
   lm_rms_eps: 1.0e-05
   lm_re_base: 100000
-  lm_max_position_embeddings: 2048
+  lm_max_position_embeddings: 4096
   lm_base_vocab_size: 49152
   extra_token_amount: 66
   lm_vocab_size: 49218
@@ -24,7 +24,7 @@ vlm:
   lm_n_blocks: 30
   lm_attn_scaling: 1.0
   lm_pad_aware_rope: false
-  lm_max_length: 2048
+  lm_max_length: 4096
   lm_use_tokens: false
   lm_tie_weights: true
   lm_model_type: HuggingFaceTB/SmolLM2-135M-Instruct
@@ -111,28 +111,34 @@ vlm:
   vlm_load_backbone_weights: true
   vlm_checkpoint_path: lusxvr/nanoVLM-230M-8k
   hf_repo_name: nanoVLM
+  
   left_mask_scope: full
-  right_prefill_mode: full
-  use_kv_bridge: true
-  kv_bridge_type: mlp
+  right_prefill_mode: non_donor_only
+
+  use_kv_bridge: false
+  kv_bridge_type: residual_nonlinear
   kv_bridge_mlp_ratio: 4.0
   kv_bridge_use_rmsnorm: true
   kv_bridge_residual: true
   kv_bridge_init_mode: default
-  right_attn_gate_mode: none
+  kv_bridge_linear_depth: 1
+  kv_bridge_adapter_depth: 2
+  kv_bridge_adapter_expansion: 1.0
+
+  right_attn_gate_mode: o_proj
   right_attn_gate_granularity: elementwise
   right_attn_gate_scope: all
   right_attn_gate_logit_bias: 4.0
-  right_attn_gate_min: 0.0
-  right_attn_gate_max: 1.0
+  right_attn_gate_min: null
+  right_attn_gate_max: null
 train:
   lr_mp: 5.0e-05
   lr_vision_backbone: 0
   lr_language_backbone: 1.0e-05
   lr_left_tower: null
   lr_right_tower: 0.0
-  lr_kv_bridge: 0.0001
-  lr_attn_gate: null
+  lr_kv_bridge: null
+  lr_attn_gate: 0.0001
   val_size: 50000
   batch_size: 8
   gradient_accumulation_steps: 16
@@ -142,10 +148,10 @@ train:
   checkpoint_interval: 200
   stats_log_interval: 100
   max_training_steps: 20000
-  warmup_ratio: 0.03
-  max_images_per_example: 1
+  warmup_ratio: 0.01
+  max_images_per_example: 5
   max_images_per_knapsack: 18
-  max_sample_length: 2048
+  max_sample_length: 4096
   use_packing: true
   compile: true
   resume_from_vlm_checkpoint: true
@@ -155,8 +161,6 @@ train:
   train_split: train
   val_split: validation
   stream_dataset: false
-  enable_source_filter: false
-  allowed_dataset_sources: []
   relevance_min_rating: 1
   image_correspondence_min_rating: 1
   visual_dependency_min_rating: 1
@@ -169,6 +173,6 @@ train:
   lmms_eval_batch_size: 64
   push_checkpoints_to_hub: true
   save_training_state_to_hub: true
-  checkpoint_repo_pattern: patrickamadeus/dualtower-full-step-{i}
+  checkpoint_repo_pattern: patrickamadeus/dualtower-full-kv-bootstrap-o-gate-step-{i}
   hf_private: false
   push_final_model_to_hub: false

@@ -64,6 +64,12 @@ class VLMConfig:
     kv_bridge_linear_depth: int = 1
     kv_bridge_adapter_depth: int = 2
     kv_bridge_adapter_expansion: float = 1.0
+    right_attn_gate_mode: str = "none"  # none | kv | o_proj | kv+o_proj
+    right_attn_gate_granularity: str = "elementwise"  # elementwise
+    right_attn_gate_scope: str = "all"  # all | donor_only
+    right_attn_gate_logit_bias: float = 4.0
+    right_attn_gate_min: float | None = 0.0
+    right_attn_gate_max: float | None = 1.0
 
 
 @dataclass
@@ -75,6 +81,7 @@ class TrainConfig:
     lr_left_tower: float | None = None
     lr_right_tower: float | None = 0.0
     lr_kv_bridge: float | None = 1e-4
+    lr_attn_gate: float | None = None
     val_size: int = 50000  # Deprecated when using explicit train/val splits.
     batch_size: int = 8
     gradient_accumulation_steps: int = 16

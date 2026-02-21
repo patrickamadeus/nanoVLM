@@ -208,10 +208,64 @@ class LanguageModelGroupedQueryAttention(nn.Module):
         self.n_kv_groups = self.n_heads // self.n_kv_heads
         self.head_dim = self.embd_dim // self.n_heads
 
-        self.q_proj = nn.Linear(self.embd_dim, self.embd_dim, bias=False)
-        self.k_proj = nn.Linear(self.embd_dim, self.head_dim * self.n_kv_heads, bias=False)
-        self.v_proj = nn.Linear(self.embd_dim, self.head_dim * self.n_kv_heads, bias=False)
+        self.right_attn_gate_mode = str(getattr(cfg, "right_attn_gate_mode", "none"))
+        valid_gate_modes = {"none", "kv", "o_proj", "kv+o_proj"}
+        if self.right_attn_gate_mode not in valid_gate_modes:
+            raise ValueError(
+                f"Unsupported right_attn_gate_mode={self.right_attn_gate_mode!r}. "
+                f"Expected one of {sorted(valid_gate_modes)}."
+            )
+
+        self.right_attn_gate_granularity = str(getattr(cfg, "right_attn_gate_granularity", "elementwise"))
+        if self.right_attn_gate_granularity != "elementwise":
+            raise ValueError(
+                f"Unsupported right_attn_gate_granularity={self.right_attn_gate_granularity!r}. "
+                "Expected 'elementwise'."
+            )
+
+        self.right_attn_gate_scope = str(getattr(cfg, "right_attn_gate_scope", "all"))
+        valid_gate_scopes = {"all", "donor_only"}
+        if self.right_attn_gate_scope not in valid_gate_scopes:
+            raise ValueError(
+                f"Unsupported right_attn_gate_scope={self.right_attn_gate_scope!r}. "
+                f"Expected one of {sorted(valid_gate_scopes)}."
+            )
+
+        gate_min_raw = getattr(cfg, "right_attn_gate_min", 0.0)
+        gate_max_raw = getattr(cfg, "right_attn_gate_max", 1.0)
+        self.right_attn_gate_logit_bias = float(getattr(cfg, "right_attn_gate_logit_bias", 4.0))
+        self.right_attn_gate_disable_remap = gate_min_raw is None and gate_max_raw is None
+        if self.right_attn_gate_disable_remap:
+            self.right_attn_gate_min = None
+            self.right_attn_gate_max = None
+        else:
+            if gate_min_raw is None or gate_max_raw is None:
+                raise ValueError(
+                    "right_attn_gate_min and right_attn_gate_max must either both be set, "
+                    "or both be None to disable range remapping."
+                )
+            self.right_attn_gate_min = float(gate_min_raw)
+            self.right_attn_gate_max = float(gate_max_raw)
+            if not (0.0 <= self.right_attn_gate_min <= self.right_attn_gate_max <= 1.0):
+                raise ValueError(
+                    "right_attn_gate_min/right_attn_gate_max must satisfy "
+                    "0.0 <= min <= max <= 1.0."
+                )
+
+        self.use_kv_gate = self.right_attn_gate_mode in {"kv", "kv+o_proj"}
+        self.use_o_proj_gate = self.right_attn_gate_mode in {"o_proj", "kv+o_proj"}
+        self.use_o_qproj_split = self.use_o_proj_gate
+        self.use_kv_proj_split = self.use_kv_gate
+
+        q_proj_out_dim = self.embd_dim * (2 if self.use_o_qproj_split else 1)
+        k_proj_out_dim = (self.head_dim * self.n_kv_heads) * (2 if self.use_kv_proj_split else 1)
+        v_proj_out_dim = (self.head_dim * self.n_kv_heads) * (2 if self.use_kv_proj_split else 1)
+        self.q_proj = nn.Linear(self.embd_dim, q_proj_out_dim, bias=False)
+        self.k_proj = nn.Linear(self.embd_dim, k_proj_out_dim, bias=False)
+        self.v_proj = nn.Linear(self.embd_dim, v_proj_out_dim, bias=False)
         self.out_proj = nn.Linear(self.embd_dim, self.embd_dim, bias=False)
+
+        self.reset_gate_parameters()
 
         self.attn_dropout = nn.Dropout(self.dropout)
         self.resid_dropout = nn.Dropout(self.dropout)
@@ -220,6 +274,81 @@ class LanguageModelGroupedQueryAttention(nn.Module):
         self.sdpa = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
         if not self.sdpa:
             print("Warning: scaled dot product attention not available, using standard attention in LM.")
+
+    def gate_parameters(self):
+        yielded = set()
+        if self.use_o_qproj_split:
+            for p in self.q_proj.parameters():
+                if id(p) not in yielded:
+                    yielded.add(id(p))
+                    yield p
+
+        if self.use_kv_proj_split:
+            for p in self.k_proj.parameters():
+                if id(p) not in yielded:
+                    yielded.add(id(p))
+                    yield p
+            for p in self.v_proj.parameters():
+                if id(p) not in yielded:
+                    yielded.add(id(p))
+                    yield p
+
+    def reset_gate_parameters(self) -> None:
+        # Projection-split gate modes rely on default Linear initialization.
+        return
+
+    @staticmethod
+    def _default_false_mask(batch_size: int, length: int, device: torch.device) -> torch.Tensor:
+        return torch.zeros((batch_size, length), device=device, dtype=torch.bool)
+
+    def _require_donor_key_mask(
+        self,
+        donor_key_mask: torch.Tensor | None,
+        batch_size: int,
+        expected_len: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if donor_key_mask is None:
+            raise ValueError("donor_key_mask is required but missing from KV cache.")
+        expected_shape = (batch_size, expected_len)
+        if tuple(donor_key_mask.shape) != expected_shape:
+            raise ValueError(
+                f"donor_key_mask shape must be {expected_shape}, got {tuple(donor_key_mask.shape)}."
+            )
+        return donor_key_mask.to(device=device, dtype=torch.bool)
+
+    def _require_kv_gate_cache(
+        self,
+        kv_gate_cache: torch.Tensor | None,
+        batch_size: int,
+        expected_len: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        gate_name: str,
+    ) -> torch.Tensor:
+        if kv_gate_cache is None:
+            raise ValueError(f"{gate_name} is required but missing from KV cache.")
+        expected_shape = (batch_size, self.n_kv_heads, expected_len, self.head_dim)
+        if tuple(kv_gate_cache.shape) != expected_shape:
+            raise ValueError(
+                f"{gate_name} shape must be {expected_shape}, got {tuple(kv_gate_cache.shape)}."
+            )
+        return kv_gate_cache.to(device=device, dtype=dtype)
+
+    def _compute_gate_from_logits(self, gate_logits: torch.Tensor) -> torch.Tensor:
+        gate = torch.sigmoid(gate_logits + self.right_attn_gate_logit_bias)
+        if not self.right_attn_gate_disable_remap:
+            gate = gate * (self.right_attn_gate_max - self.right_attn_gate_min) + self.right_attn_gate_min
+        return gate
+
+    def _apply_gate_scope(self, gate: torch.Tensor, donor_mask: torch.Tensor | None) -> torch.Tensor:
+        if self.right_attn_gate_scope != "donor_only":
+            return gate
+        if donor_mask is None:
+            return torch.ones_like(gate)
+
+        scoped_mask = donor_mask.to(device=gate.device, dtype=torch.bool).unsqueeze(1).unsqueeze(-1)
+        return torch.where(scoped_mask, gate, torch.ones_like(gate))
 
     @staticmethod
     def _build_dual_prefill_attn_mask(
@@ -271,27 +400,62 @@ class LanguageModelGroupedQueryAttention(nn.Module):
         """
         B, T_curr, C = x.size() # T_curr is the sequence length of the current input x
 
-        q_curr = self.q_proj(x).view(B, T_curr, self.n_heads, self.head_dim).transpose(1, 2)  # (B, n_heads, T_curr, head_dim)
-        k_curr = self.k_proj(x).view(B, T_curr, self.n_kv_heads, self.head_dim).transpose(1, 2) # (B, n_kv_heads, T_curr, head_dim)
-        v_curr = self.v_proj(x).view(B, T_curr, self.n_kv_heads, self.head_dim).transpose(1, 2) # (B, n_kv_heads, T_curr, head_dim)
+        q_proj_out = self.q_proj(x)
+        o_gate_logits = None
+        if self.use_o_qproj_split:
+            q_and_gate = q_proj_out.view(B, T_curr, self.n_heads, self.head_dim * 2)
+            q_curr = q_and_gate[..., : self.head_dim].transpose(1, 2)  # (B, n_heads, T_curr, head_dim)
+            o_gate_logits = q_and_gate[..., self.head_dim :].transpose(1, 2)
+        else:
+            q_curr = q_proj_out.view(B, T_curr, self.n_heads, self.head_dim).transpose(1, 2)  # (B, n_heads, T_curr, head_dim)
+        k_proj_out = self.k_proj(x)
+        v_proj_out = self.v_proj(x)
+        k_gate_curr = None
+        v_gate_curr = None
+        if self.use_kv_proj_split:
+            k_and_gate = k_proj_out.view(B, T_curr, self.n_kv_heads, self.head_dim * 2)
+            k_curr = k_and_gate[..., : self.head_dim].transpose(1, 2)  # (B, n_kv_heads, T_curr, head_dim)
+            k_gate_logits_curr = k_and_gate[..., self.head_dim :].transpose(1, 2)
+            k_gate_curr = self._compute_gate_from_logits(k_gate_logits_curr)
+            v_and_gate = v_proj_out.view(B, T_curr, self.n_kv_heads, self.head_dim * 2)
+            v_curr = v_and_gate[..., : self.head_dim].transpose(1, 2)  # (B, n_kv_heads, T_curr, head_dim)
+            v_gate_logits_curr = v_and_gate[..., self.head_dim :].transpose(1, 2)
+            v_gate_curr = self._compute_gate_from_logits(v_gate_logits_curr)
+        else:
+            k_curr = k_proj_out.view(B, T_curr, self.n_kv_heads, self.head_dim).transpose(1, 2) # (B, n_kv_heads, T_curr, head_dim)
+            v_curr = v_proj_out.view(B, T_curr, self.n_kv_heads, self.head_dim).transpose(1, 2) # (B, n_kv_heads, T_curr, head_dim)
 
         # Apply rotary embeddings to the current q and k
         q, k_rotated = apply_rotary_pos_embd(q_curr, k_curr, cos, sin)
 
         dual_prefill_attn_mask_bool = None
+        query_replace_mask = None
+        donor_key_mask = None
+        k_gate = None
+        v_gate = None
         if block_kv_cache is None:
             # No cache, this is the first pass (prefill)
             k = k_rotated
             v = v_curr
-            block_kv_cache = {'key': k, 'value': v}
+            donor_key_mask = self._default_false_mask(B, T_curr, x.device)
+            block_kv_cache = {'key': k, 'value': v, 'donor_key_mask': donor_key_mask}
+            if self.use_kv_gate:
+                if k_gate_curr is None or v_gate_curr is None:
+                    raise ValueError("KV gating expected k_proj/v_proj split logits, but none were produced.")
+                k_gate = k_gate_curr
+                v_gate = v_gate_curr
+                block_kv_cache["k_gate"] = k_gate
+                block_kv_cache["v_gate"] = v_gate
         else:
             k_cached = block_kv_cache.get("key")
             v_cached = block_kv_cache.get("value")
+            k_gate_cached = block_kv_cache.get("k_gate")
+            v_gate_cached = block_kv_cache.get("v_gate")
+            donor_key_mask_cached = block_kv_cache.get("donor_key_mask")
             query_only = bool(block_kv_cache.get("query_only", False))
             needs_dual_prefill = bool(block_kv_cache.get("needs_dual_prefill", False))
             replace_mask = block_kv_cache.get("replace_mask")
             if replace_mask is None:
-                # Backward compatibility for older checkpoints/runtime code.
                 replace_mask = block_kv_cache.get("img_mask")
 
             # Optional dual-prefill mode:
@@ -301,6 +465,32 @@ class LanguageModelGroupedQueryAttention(nn.Module):
                     raise ValueError("query_only attention requires existing cached `key` and `value` tensors.")
                 k = k_cached
                 v = v_cached
+                donor_key_mask = self._require_donor_key_mask(
+                    donor_key_mask_cached,
+                    batch_size=B,
+                    expected_len=k.size(2),
+                    device=x.device,
+                )
+                block_kv_cache["donor_key_mask"] = donor_key_mask
+                if self.use_kv_gate:
+                    k_gate = self._require_kv_gate_cache(
+                        k_gate_cached,
+                        batch_size=B,
+                        expected_len=k.size(2),
+                        device=x.device,
+                        dtype=k.dtype,
+                        gate_name="k_gate",
+                    )
+                    v_gate = self._require_kv_gate_cache(
+                        v_gate_cached,
+                        batch_size=B,
+                        expected_len=k.size(2),
+                        device=x.device,
+                        dtype=v.dtype,
+                        gate_name="v_gate",
+                    )
+                    block_kv_cache["k_gate"] = k_gate
+                    block_kv_cache["v_gate"] = v_gate
                 # Keep cache tensors unchanged for subsequent decode append.
                 block_kv_cache["needs_dual_prefill"] = False
                 block_kv_cache.pop("replace_mask", None)
@@ -317,11 +507,24 @@ class LanguageModelGroupedQueryAttention(nn.Module):
                         f"Dual prefill `replace_mask` shape must be {(B, T_curr)}, got {None if replace_mask is None else tuple(replace_mask.shape)}."
                     )
 
-                mask_4d = replace_mask.to(device=x.device, dtype=torch.bool).unsqueeze(1).unsqueeze(-1)  # [B,1,T,1]
+                replace_mask_bool = replace_mask.to(device=x.device, dtype=torch.bool)
+                if attention_mask is not None:
+                    replace_mask_bool = replace_mask_bool & attention_mask[:, :T_curr].to(torch.bool)
+
+                query_replace_mask = replace_mask_bool
+                mask_4d = replace_mask_bool.unsqueeze(1).unsqueeze(-1)  # [B,1,T,1]
                 k = torch.where(mask_4d, k_cached, k_rotated)
                 v = torch.where(mask_4d, v_cached, v_curr)
                 block_kv_cache['key'] = k
                 block_kv_cache['value'] = v
+                block_kv_cache["donor_key_mask"] = replace_mask_bool
+                if self.use_kv_gate:
+                    if k_gate_curr is None or v_gate_curr is None:
+                        raise ValueError("KV gating expected k_proj/v_proj split logits, but none were produced.")
+                    k_gate = k_gate_curr
+                    v_gate = v_gate_curr
+                    block_kv_cache["k_gate"] = k_gate
+                    block_kv_cache["v_gate"] = v_gate
 
                 # Restore legacy dual-prefill interaction pattern only for partial donor scope.
                 # If all valid tokens are donor tokens (full scope), keep standard causal semantics.
@@ -329,7 +532,6 @@ class LanguageModelGroupedQueryAttention(nn.Module):
                     key_valid_mask = torch.ones((B, T_curr), device=x.device, dtype=torch.bool)
                 else:
                     key_valid_mask = attention_mask[:, :T_curr].to(torch.bool)
-                replace_mask_bool = replace_mask.to(device=x.device, dtype=torch.bool)
                 replace_all_valid = torch.equal(replace_mask_bool, key_valid_mask)
                 if not replace_all_valid:
                     dual_prefill_attn_mask_bool = self._build_dual_prefill_attn_mask(
@@ -340,24 +542,85 @@ class LanguageModelGroupedQueryAttention(nn.Module):
                 block_kv_cache['needs_dual_prefill'] = False
                 block_kv_cache.pop("replace_mask", None)
                 block_kv_cache.pop("img_mask", None)
+                donor_key_mask = replace_mask_bool
             elif k_cached is not None and v_cached is not None:
                 # Standard decode path: append new K/V to cached prefix.
                 k = torch.cat([k_cached, k_rotated], dim=2)
                 v = torch.cat([v_cached, v_curr], dim=2)
                 block_kv_cache['key'] = k
                 block_kv_cache['value'] = v
+                if self.use_kv_gate:
+                    if k_gate_curr is None or v_gate_curr is None:
+                        raise ValueError("KV gating expected k_proj/v_proj split logits, but none were produced.")
+                    k_gate_prefix = self._require_kv_gate_cache(
+                        k_gate_cached,
+                        batch_size=B,
+                        expected_len=k_cached.size(2),
+                        device=x.device,
+                        dtype=k_cached.dtype,
+                        gate_name="k_gate",
+                    )
+                    v_gate_prefix = self._require_kv_gate_cache(
+                        v_gate_cached,
+                        batch_size=B,
+                        expected_len=k_cached.size(2),
+                        device=x.device,
+                        dtype=v_cached.dtype,
+                        gate_name="v_gate",
+                    )
+                    k_gate = torch.cat([k_gate_prefix, k_gate_curr], dim=2)
+                    v_gate = torch.cat([v_gate_prefix, v_gate_curr], dim=2)
+                    block_kv_cache["k_gate"] = k_gate
+                    block_kv_cache["v_gate"] = v_gate
+                donor_prefix_mask = self._require_donor_key_mask(
+                    donor_key_mask_cached,
+                    batch_size=B,
+                    expected_len=k_cached.size(2),
+                    device=x.device,
+                )
+                donor_suffix_mask = self._default_false_mask(B, T_curr, x.device)
+                donor_key_mask = torch.cat([donor_prefix_mask, donor_suffix_mask], dim=1)
+                block_kv_cache["donor_key_mask"] = donor_key_mask
             else:
-                # Fallback to prefill semantics if an empty cache container is provided.
-                k = k_rotated
-                v = v_curr
-                block_kv_cache['key'] = k
-                block_kv_cache['value'] = v
+                raise ValueError(
+                    "Non-empty block_kv_cache is required to contain both `key` and `value`."
+                )
 
         # Repeat K, V for Grouped Query Attention
         k_exp = k.repeat_interleave(self.n_kv_groups, dim=1) # (B, n_heads, T_kv, head_dim)
         v_exp = v.repeat_interleave(self.n_kv_groups, dim=1) # (B, n_heads, T_kv, head_dim)
         
         T_kv = k_exp.size(2) # Total sequence length of keys/values
+        donor_key_mask = self._require_donor_key_mask(
+            donor_key_mask,
+            batch_size=B,
+            expected_len=T_kv,
+            device=x.device,
+        )
+
+        if self.use_kv_gate:
+            k_gate = self._require_kv_gate_cache(
+                k_gate,
+                batch_size=B,
+                expected_len=T_kv,
+                device=x.device,
+                dtype=k_exp.dtype,
+                gate_name="k_gate",
+            )
+            v_gate = self._require_kv_gate_cache(
+                v_gate,
+                batch_size=B,
+                expected_len=T_kv,
+                device=x.device,
+                dtype=v_exp.dtype,
+                gate_name="v_gate",
+            )
+            k_gate_exp = k_gate.repeat_interleave(self.n_kv_groups, dim=1)
+            v_gate_exp = v_gate.repeat_interleave(self.n_kv_groups, dim=1)
+            k_gate_exp = self._apply_gate_scope(k_gate_exp, donor_key_mask)
+            v_gate_exp = self._apply_gate_scope(v_gate_exp, donor_key_mask)
+            k_exp = k_exp * k_gate_exp
+            v_exp = v_exp * v_gate_exp
 
         # Prepare attention mask for SDPA or manual path
         # attention_mask is (B, T_kv_total_length), 1 for attend, 0 for pad
@@ -408,7 +671,17 @@ class LanguageModelGroupedQueryAttention(nn.Module):
             attn = F.softmax(attn, dim=-1)
             attn = self.attn_dropout(attn)
             y = attn @ v_exp
-            
+
+        if self.use_o_proj_gate:
+            if o_gate_logits is None:
+                raise ValueError("O-proj gating expected q_proj split logits, but none were produced.")
+            o_gate = self._compute_gate_from_logits(o_gate_logits)
+            query_scope_mask = query_replace_mask
+            if query_scope_mask is None:
+                query_scope_mask = self._default_false_mask(B, T_curr, x.device)
+            o_gate = self._apply_gate_scope(o_gate, query_scope_mask)
+            y = y * o_gate
+
         y = y.transpose(1, 2).contiguous().view(B, T_curr, C)
         y = self.out_proj(y)
         y = self.resid_dropout(y)
@@ -522,6 +795,8 @@ class LanguageModel(nn.Module):
             self.head.weight = self.token_embedding.weight
 
         self.apply(self._init_weights)
+        for block in self.blocks:
+            block.attn.reset_gate_parameters()
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -532,6 +807,10 @@ class LanguageModel(nn.Module):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
         elif isinstance(module, RMSNorm):
             module.weight.data.fill_(1.0)
+
+    def attn_gate_parameters(self):
+        for block in self.blocks:
+            yield from block.attn.gate_parameters()
 
     def forward(self, x: torch.Tensor, attention_mask: torch.Tensor=None, kv_cache: list[dict]=None, start_pos: int=0):
         """
@@ -757,6 +1036,7 @@ class LanguageModel(nn.Module):
                     
                     if hf_key in f.keys() and our_key in sd:
                         tensor = f.get_tensor(hf_key)
+                        key_loaded = False
                         
                         # Special handling for token embeddings if vocab sizes differ
                         if hf_key == 'model.embed_tokens.weight' and tensor.shape[0] != sd[our_key].shape[0]:
@@ -772,12 +1052,33 @@ class LanguageModel(nn.Module):
                             
                             print(f"Initialized {sd[our_key].shape[0] - tensor.shape[0]} new token embeddings")
                             sd['head.weight'].copy_(sd[our_key])  # Update the head weights as well
+                            key_loaded = True
                         elif tensor.shape == sd[our_key].shape:
                             sd[our_key].copy_(tensor)
+                            key_loaded = True
+                        elif (
+                            hf_key.endswith("self_attn.q_proj.weight")
+                            or hf_key.endswith("self_attn.k_proj.weight")
+                            or hf_key.endswith("self_attn.v_proj.weight")
+                        ) and (
+                            tensor.dim() == 2
+                            and sd[our_key].dim() == 2
+                            and tensor.shape[1] == sd[our_key].shape[1]
+                            and tensor.shape[0] < sd[our_key].shape[0]
+                        ):
+                            # Projection-split gating variant: copy pretrained base rows and keep
+                            # extra gate rows at their default model initialization.
+                            sd[our_key][: tensor.shape[0]].copy_(tensor)
+                            print(
+                                f"Expanded projection load for {our_key}: copied {tensor.shape[0]} rows, "
+                                f"kept extra {sd[our_key].shape[0] - tensor.shape[0]} rows at default init."
+                            )
+                            key_loaded = True
                         else:
                             print(f"Shape mismatch for {hf_key} -> {our_key}: {tensor.shape} vs {sd[our_key].shape}")
-                        
-                        loaded_keys.add(our_key)
+
+                        if key_loaded:
+                            loaded_keys.add(our_key)
 
         for hf_key, our_key in mapping.items():
             if our_key not in loaded_keys:

@@ -27,6 +27,12 @@ def apply_object_overrides(
     tuple_fields = tuple_fields or set()
     for key, value in overrides.items():
         if not hasattr(obj, key):
+            if object_name == "VLMConfig" and key == "right_attn_gate_init_logit":
+                print(
+                    "Warning: Ignoring deprecated VLMConfig field `right_attn_gate_init_logit`; "
+                    "projection-split gating uses default Linear initialization."
+                )
+                continue
             raise ValueError(f"Unknown {object_name} field in config: {key}")
         if key in tuple_fields and isinstance(value, list):
             value = tuple(value)

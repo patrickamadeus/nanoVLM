@@ -141,6 +141,59 @@ Main bridge knobs (recommended start: linear residual):
 
 Ablation commands and knob reference: `DUALTOWER_KV_BRIDGE_ABLATIONS.md`.
 
+### DualTower Right-Tower Gated Attention (KV / O-Proj)
+
+DualTower right-tower attention now supports configurable gating to make decode-time attention less naive when consuming transported K/V.
+Gating is applied on the right tower only; the left tower decoder is forced to ungated attention.
+
+Config knobs (YAML / `VLMConfig`):
+- `right_attn_gate_mode`: `none | kv | o_proj | kv+o_proj`
+- `right_attn_gate_granularity`: `elementwise` (current implementation)
+- `right_attn_gate_scope`: `all | donor_only`
+- `right_attn_gate_logit_bias`: float (default `4.0`, soft-start near identity)
+- `right_attn_gate_min`: float or `null` (default `0.0`)
+- `right_attn_gate_max`: float or `null` (default `1.0`)
+
+Training LR knob (`TrainConfig` / CLI):
+- `lr_attn_gate` (CLI: `--lr_attn_gate`) for gate parameters, independent from `lr_kv_bridge`.
+
+Where the gate is applied:
+- `kv`: multiplies expanded keys/values before aggregation (`k_exp = k_exp * gate_k`, `v_exp = v_exp * gate_v`)
+- `o_proj`: multiplies attention output before output projection (`y = y * gate`, then `o_proj(y)`)
+- `kv+o_proj`: both
+
+How gate values are computed:
+- For modes containing `o_proj`: gate logits come from expanded `q_proj` output (Q slice + gate-logit slice).
+- For modes containing `kv`: gate logits come from expanded `k_proj` + `v_proj` outputs (K/V slice + gate-logit slice).
+- Gate value is `sigmoid(logit + right_attn_gate_logit_bias)`, then linearly remapped into `[right_attn_gate_min, right_attn_gate_max]`.
+- If both `right_attn_gate_min: null` and `right_attn_gate_max: null`, remapping is disabled (pure sigmoid gate, no extra cap/remap).
+
+Why `right_attn_gate_min/max` exist:
+- They bound gate magnitude for numerical and optimization stability.
+- They make gate range explicit and tunable across experiments.
+- Default `[0,1]` gives standard multiplicative attenuation behavior.
+- Set both to `null` to disable remapping entirely.
+
+`right_attn_gate_scope` behavior:
+- `all`: gating always active on the selected path.
+- `donor_only`: gating only applies on donor-transferred positions (non-donor positions receive gate value `1`).
+
+Ready-to-run full-KV configs:
+- O-proj only: `configs/train.full-kv.bootstrap.dualtower-nobridge-o-gate.yaml`
+- KV only: `configs/train.full-kv.bootstrap.dualtower-nobridge-kv-gate.yaml`
+
+Example:
+```bash
+python train.py --config configs/train.full-kv.bootstrap.dualtower-nobridge-o-gate.yaml
+python train.py --config configs/train.full-kv.bootstrap.dualtower-nobridge-kv-gate.yaml
+```
+
+Relation to `gated_attention/modeling_qwen3.py`:
+- `o_proj` gating is conceptually aligned (gate computed from query-side features, applied before output projection).
+- For modes containing `o_proj`, this repo uses expanded `q_proj` and splits it into Q slice + gate-logit slice.
+- For modes containing `kv`, this repo applies the same projection-split idea to both `k_proj` and `v_proj`.
+- This repo additionally supports `kv` gating and `donor_only` scope, which are DualTower-specific extensions.
+
 `train.py` computes loss with `loss_reduction="sum"` and normalizes updates/metrics by the number of valid target tokens (`labels != -100`) across gradient accumulation (and across all ranks in DDP).
 When logging, `train/batch_loss` is the current microbatch token-normalized loss, and `train/step_loss` is the token-normalized loss used for the optimizer step.
 It also logs `effective_token_ratio_per_instance = mean_i(valid_target_tokens_i / attention_tokens_i)` for training.
