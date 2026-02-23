@@ -424,7 +424,7 @@ def get_dataloaders(train_cfg, vlm_cfg, generator_states: dict | None = None):
         dataset_names_to_load = [train_cfg.train_dataset_path + f"/shard_{i}" for i in range(total_shards)]
         use_subset_names = True
 
-    if use_subset_names and any(name in {"_all_", "all"} for name in dataset_names_to_load):
+    if use_subset_names and any(name in {"_all_"} for name in dataset_names_to_load):
         dataset_names_to_load = get_dataset_config_names(train_cfg.train_dataset_path)
         if not dataset_names_to_load:
             raise ValueError(
@@ -575,7 +575,7 @@ def get_dataloaders(train_cfg, vlm_cfg, generator_states: dict | None = None):
         train_dataset,
         batch_size=train_cfg.batch_size,    # =per device BS in DDP
         collate_fn=vqa_collator,
-        num_workers=4,
+        num_workers=1,
         pin_memory=True,
         persistent_workers=True,
         drop_last=True,
