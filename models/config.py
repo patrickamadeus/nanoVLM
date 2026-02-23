@@ -55,6 +55,9 @@ class VLMConfig:
     hf_repo_name: str = 'nanoVLM'
     left_mask_scope: str = "full"  # visual_only | visual_sys | full
     right_prefill_mode: str = "full"  # full | non_donor_only (generation only)
+    use_right_kv_cache_gates: bool = False
+    right_kv_gate_normalize: bool = False
+    right_kv_gate_init_offdiag: float = 1e-3
     use_kv_bridge: bool = True
     kv_bridge_type: str = "mlp"  # linear | mlp | scaled_linear | residual_nonlinear
     kv_bridge_mlp_ratio: float = 4.0
@@ -74,6 +77,7 @@ class TrainConfig:
     # DualTower-specific explicit LR controls. If None, falls back to lr_language_backbone.
     lr_left_tower: float | None = None
     lr_right_tower: float | None = 0.0
+    lr_right_kv_gates: float | None = 1e-4
     lr_kv_bridge: float | None = 1e-4
     val_size: int = 50000  # Deprecated when using explicit train/val splits.
     batch_size: int = 8

@@ -148,6 +148,13 @@ def get_optimizer_lrs(optimizer, train_cfg):
         and param_group_idx < len(optimizer.param_groups)
     ):
         lrs["lr_kv_bridge"] = optimizer.param_groups[param_group_idx]["lr"]
+        param_group_idx += 1
+    if (
+        train_cfg.lr_right_kv_gates is not None
+        and train_cfg.lr_right_kv_gates > 0
+        and param_group_idx < len(optimizer.param_groups)
+    ):
+        lrs["lr_right_kv_gates"] = optimizer.param_groups[param_group_idx]["lr"]
     return lrs
 
 
@@ -931,12 +938,18 @@ def train(train_cfg, vlm_cfg, model_mode: str = "nanovlm"):
         if train_cfg.lr_kv_bridge is not None
         else train_cfg.lr_language_backbone
     )
+    right_kv_gates_lr = (
+        train_cfg.lr_right_kv_gates
+        if train_cfg.lr_right_kv_gates is not None
+        else train_cfg.lr_language_backbone
+    )
 
     mp_module = model.left_tower.MP if model_mode == "dualtower" and hasattr(model, "left_tower") else model.MP
     vision_module = model.left_tower.vision_encoder if model_mode == "dualtower" and hasattr(model, "left_tower") else model.vision_encoder
 
     if model_mode == "dualtower" and hasattr(model, "left_tower") and hasattr(model, "right_tower"):
         kv_bridge_module = getattr(model, "kv_bridge", None)
+        right_kv_gates_module = getattr(model, "right_kv_cache_gates", None)
         bridge_only_mode = bool(getattr(vlm_cfg, "use_kv_bridge", False))
 
         if bridge_only_mode:
@@ -981,6 +994,13 @@ def train(train_cfg, vlm_cfg, model_mode: str = "nanovlm"):
                     param_groups.append({'name': 'lr_kv_bridge', 'params': list(kv_bridge_module.parameters()), 'lr': kv_bridge_lr})
                 else:
                     for p in list(kv_bridge_module.parameters()):
+                        p.requires_grad = False
+
+            if right_kv_gates_module is not None:
+                if right_kv_gates_lr is not None and right_kv_gates_lr > 0:
+                    param_groups.append({'name': 'lr_right_kv_gates', 'params': list(right_kv_gates_module.parameters()), 'lr': right_kv_gates_lr})
+                else:
+                    for p in list(right_kv_gates_module.parameters()):
                         p.requires_grad = False
     else:
         if train_cfg.lr_mp > 0:
@@ -1280,6 +1300,12 @@ def train(train_cfg, vlm_cfg, model_mode: str = "nanovlm"):
                             if train_cfg.lr_kv_bridge is not None
                             else train_cfg.lr_language_backbone
                         )
+                    elif group_name == "lr_right_kv_gates":
+                        max_lr = (
+                            train_cfg.lr_right_kv_gates
+                            if train_cfg.lr_right_kv_gates is not None
+                            else train_cfg.lr_language_backbone
+                        )
 
                     if max_lr is not None and max_lr > 0:
                         group['lr'] = get_lr(
@@ -1542,6 +1568,7 @@ def train(train_cfg, vlm_cfg, model_mode: str = "nanovlm"):
                         f"lr_left={stats.get('lr_left_tower', 0.0):.6g} "
                         f"lr_right={stats.get('lr_right_tower', 0.0):.6g} "
                         f"lr_bridge={stats.get('lr_kv_bridge', 0.0):.6g} "
+                        f"lr_right_kv_gates={stats.get('lr_right_kv_gates', 0.0):.6g} "
                         + (f"grad_norm={stats['grad_norm']:.4f}" if 'grad_norm' in stats else "")
                     )
                 
@@ -1680,6 +1707,7 @@ def main():
     parser.add_argument('--lr_left_tower', type=float, help='DualTower: learning rate for the left tower language decoder')
     parser.add_argument('--lr_right_tower', type=float, help='DualTower: learning rate for the right tower')
     parser.add_argument('--lr_kv_bridge', type=float, help='DualTower: learning rate for KV bridge module')
+    parser.add_argument('--lr_right_kv_gates', type=float, help='DualTower: learning rate for right KV cache gates module')
     parser.add_argument('--vlm_checkpoint_path', type=str, help='Path or repo ID of the VLM checkpoint for loading')
     parser.add_argument(
         '--left_mask_scope',
@@ -1689,8 +1717,12 @@ def main():
     )
     parser.add_argument('--disable_kv_bridge', action='store_true', help='Disable KV bridge (enabled by default).')
     parser.add_argument('--enable_kv_bridge', action='store_true', help='Legacy compatibility flag. KV bridge is enabled by default.')
-    parser.add_argument('--kv_bridge_type', type=str, choices=['linear', 'mlp'], help='DualTower KV bridge architecture')
+    parser.add_argument('--kv_bridge_type', type=str, choices=['linear', 'mlp', 'scaled_linear', 'residual_nonlinear'], help='DualTower KV bridge architecture')
     parser.add_argument('--kv_bridge_mlp_ratio', type=float, help='DualTower KV bridge MLP hidden ratio')
+    parser.add_argument('--enable_right_kv_cache_gates', action='store_true', help='Enable right KV cache layer-gating mixer.')
+    parser.add_argument('--disable_right_kv_cache_gates', action='store_true', help='Disable right KV cache layer-gating mixer.')
+    parser.add_argument('--right_kv_gate_normalize', action='store_true', help='Normalize per-layer right KV gate weights to sum to 1.')
+    parser.add_argument('--right_kv_gate_init_offdiag', type=float, help='Initial off-diagonal weight for right KV gate matrix.')
     parser.add_argument(
         '--kv_bridge_init_mode',
         type=str,
@@ -1751,6 +1783,8 @@ def main():
         train_cfg.lr_right_tower = args.lr_right_tower
     if args.lr_kv_bridge is not None:
         train_cfg.lr_kv_bridge = args.lr_kv_bridge
+    if args.lr_right_kv_gates is not None:
+        train_cfg.lr_right_kv_gates = args.lr_right_kv_gates
     if args.vlm_checkpoint_path is not None:
         vlm_cfg.vlm_checkpoint_path = args.vlm_checkpoint_path
     if args.left_mask_scope is not None:
@@ -1763,6 +1797,14 @@ def main():
         vlm_cfg.kv_bridge_type = args.kv_bridge_type
     if args.kv_bridge_mlp_ratio is not None:
         vlm_cfg.kv_bridge_mlp_ratio = args.kv_bridge_mlp_ratio
+    if args.enable_right_kv_cache_gates:
+        vlm_cfg.use_right_kv_cache_gates = True
+    if args.disable_right_kv_cache_gates:
+        vlm_cfg.use_right_kv_cache_gates = False
+    if args.right_kv_gate_normalize:
+        vlm_cfg.right_kv_gate_normalize = True
+    if args.right_kv_gate_init_offdiag is not None:
+        vlm_cfg.right_kv_gate_init_offdiag = args.right_kv_gate_init_offdiag
     if args.kv_bridge_init_mode is not None:
         vlm_cfg.kv_bridge_init_mode = args.kv_bridge_init_mode
     if args.kv_bridge_no_rmsnorm:

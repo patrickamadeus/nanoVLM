@@ -324,6 +324,57 @@ class KVCacheBridge(nn.Module):
         return kv_cache
 
 
+class RightKVCacheGates(nn.Module):
+    def __init__(self, n_layers: int, *, normalize: bool, init_offdiag: float):
+        super().__init__()
+        gate = torch.zeros(n_layers, n_layers)
+        for target_layer in range(n_layers):
+            gate[target_layer, target_layer] = 1.0
+            if target_layer + 1 < n_layers:
+                gate[target_layer, target_layer + 1:] = init_offdiag
+
+        self.layer_gate = nn.Parameter(gate)
+        self.register_buffer(
+            "layer_gate_mask",
+            torch.triu(torch.ones(n_layers, n_layers), diagonal=0),
+        )
+        self.normalize = normalize
+
+    def forward(self, kv_cache: list[dict], *, only_last_token: bool = False) -> list[dict]:
+        n_layers = self.layer_gate.size(0)
+        if len(kv_cache) != n_layers:
+            raise ValueError(f"RightKVCacheGates expected {n_layers} layers, got {len(kv_cache)}.")
+
+        for layer_idx, layer_cache in enumerate(kv_cache):
+            if layer_cache is None:
+                raise ValueError(f"RightKVCacheGates expected cache dict at layer {layer_idx}, got None.")
+            if layer_cache.get("key") is None or layer_cache.get("value") is None:
+                raise ValueError(f"RightKVCacheGates expected 'key' and 'value' at layer {layer_idx}.")
+
+        keys = torch.stack([layer_cache["key"] for layer_cache in kv_cache], dim=0)
+        values = torch.stack([layer_cache["value"] for layer_cache in kv_cache], dim=0)
+
+        gate = self.layer_gate * self.layer_gate_mask
+        if self.normalize:
+            gate = gate / gate.sum(dim=1, keepdim=True).clamp_min(1e-8)
+        gate = gate.to(dtype=keys.dtype, device=keys.device)
+
+        if only_last_token:
+            mixed_keys_last = torch.einsum("ij,jbhtd->ibhtd", gate, keys[:, :, :, -1:, :])
+            mixed_values_last = torch.einsum("ij,jbhtd->ibhtd", gate, values[:, :, :, -1:, :])
+            for layer_idx, layer_cache in enumerate(kv_cache):
+                layer_cache["key"][:, :, -1:, :] = mixed_keys_last[layer_idx]
+                layer_cache["value"][:, :, -1:, :] = mixed_values_last[layer_idx]
+            return kv_cache
+
+        mixed_keys = torch.einsum("ij,jbhtd->ibhtd", gate, keys)
+        mixed_values = torch.einsum("ij,jbhtd->ibhtd", gate, values)
+        for layer_idx, layer_cache in enumerate(kv_cache):
+            layer_cache["key"] = mixed_keys[layer_idx]
+            layer_cache["value"] = mixed_values[layer_idx]
+        return kv_cache
+
+
 class DualTowerVLM(nn.Module):
     def __init__(
         self,
@@ -363,6 +414,15 @@ class DualTowerVLM(nn.Module):
                 f"Unsupported right_prefill_mode={self.right_prefill_mode!r}. "
                 f"Expected one of {sorted(valid_prefill_modes)}."
             )
+        self.right_kv_cache_gates = (
+            RightKVCacheGates(
+                int(cfg.lm_n_blocks),
+                normalize=bool(getattr(cfg, "right_kv_gate_normalize", False)),
+                init_offdiag=float(getattr(cfg, "right_kv_gate_init_offdiag", 1e-3)),
+            )
+            if getattr(cfg, "use_right_kv_cache_gates", False)
+            else None
+        )
         self.kv_bridge = KVCacheBridge(cfg) if getattr(cfg, "use_kv_bridge", False) else None
         self.tokenizer = self.left_tower.tokenizer
         self._kv_replace_token_ids = self._collect_kv_replace_token_ids()
@@ -437,6 +497,9 @@ class DualTowerVLM(nn.Module):
 
     def _annotate_left_kv_cache(self, kv_cache: list[dict], input_ids: torch.Tensor, attention_mask: torch.Tensor = None):
         # Right tower uses this mask to replace K/V from left cache over the configured scope.
+        if self.right_kv_cache_gates is not None:
+            kv_cache = self.right_kv_cache_gates(kv_cache)
+
         if self.kv_bridge is not None:
             kv_cache = self.kv_bridge(kv_cache)
 
@@ -769,6 +832,9 @@ class DualTowerVLM(nn.Module):
                 kv_cache=kv_cache,
                 start_pos=current_token_start_pos
             )
+            if self.right_kv_cache_gates is not None:
+                # Gate only newly appended decode token to avoid re-mixing the full prefix each step.
+                kv_cache = self.right_kv_cache_gates(kv_cache, only_last_token=True)
             
             last_token_output = decode_step_output[:, -1, :]
             
