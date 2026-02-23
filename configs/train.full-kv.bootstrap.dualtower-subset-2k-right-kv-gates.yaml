@@ -115,7 +115,7 @@ vlm:
   right_prefill_mode: non_donor_only
   use_right_kv_cache_gates: true
   right_kv_gate_normalize: false
-  right_kv_gate_init_offdiag: 0.001
+  right_kv_gate_init_offdiag: 0.01
   use_kv_bridge: false
   kv_bridge_type: mlp
   kv_bridge_mlp_ratio: 4.0
@@ -128,7 +128,7 @@ train:
   lr_language_backbone: 2.0e-05
   lr_left_tower: null
   lr_right_tower: 0.0
-  lr_right_kv_gates: 1.0e-05
+  lr_right_kv_gates: 2.0e-04
   lr_kv_bridge: null
   val_size: 50000
   batch_size: 16

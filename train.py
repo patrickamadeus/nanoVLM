@@ -654,6 +654,63 @@ def _base_model(model):
     return model.module if hasattr(model, "module") else model
 
 
+def _collect_right_kv_gate_stats(model) -> dict[str, float]:
+    base = _base_model(model)
+    gates_module = getattr(base, "right_kv_cache_gates", None)
+    if gates_module is None or not hasattr(gates_module, "layer_gate"):
+        return {}
+
+    with torch.no_grad():
+        gate = gates_module.layer_gate.detach().to(dtype=torch.float32)
+        mask = gates_module.layer_gate_mask.detach().to(dtype=torch.float32)
+        active_gate = gate * mask
+        n_layers = int(active_gate.size(0))
+        eye = torch.eye(n_layers, device=active_gate.device, dtype=active_gate.dtype)
+        offdiag_mask = (mask - eye).to(torch.bool)
+
+        drift = active_gate - eye
+        row_sum = active_gate.sum(dim=1)
+        row_abs_sum = active_gate.abs().sum(dim=1, keepdim=True).clamp_min(1e-12)
+        contrib_abs = active_gate.abs() / row_abs_sum
+
+        diag_vals = torch.diag(active_gate)
+        offdiag_vals = active_gate[offdiag_mask]
+
+        stats = {
+            "right_kv_gates/drift_fro": float(torch.norm(drift, p="fro").item()),
+            "right_kv_gates/drift_l1_mean": float(drift.abs().mean().item()),
+            "right_kv_gates/diag_mean": float(diag_vals.mean().item()),
+            "right_kv_gates/diag_min": float(diag_vals.min().item()),
+            "right_kv_gates/diag_max": float(diag_vals.max().item()),
+            "right_kv_gates/row_sum_mean": float(row_sum.mean().item()),
+            "right_kv_gates/row_sum_min": float(row_sum.min().item()),
+            "right_kv_gates/row_sum_max": float(row_sum.max().item()),
+        }
+        if offdiag_vals.numel() > 0:
+            stats["right_kv_gates/offdiag_mean"] = float(offdiag_vals.mean().item())
+            stats["right_kv_gates/offdiag_abs_mean"] = float(offdiag_vals.abs().mean().item())
+            stats["right_kv_gates/offdiag_max"] = float(offdiag_vals.max().item())
+            stats["right_kv_gates/offdiag_min"] = float(offdiag_vals.min().item())
+
+        for target_idx in range(n_layers):
+            stats[f"right_kv_gates_row/self_share_layer_{target_idx + 1}"] = float(
+                contrib_abs[target_idx, target_idx].item()
+            )
+            stats[f"right_kv_gates_row/future_share_layer_{target_idx + 1}"] = float(
+                contrib_abs[target_idx, target_idx + 1 :].sum().item()
+            )
+            stats[f"right_kv_gates_row/signed_sum_layer_{target_idx + 1}"] = float(
+                row_sum[target_idx].item()
+            )
+
+            for source_idx in range(target_idx, n_layers):
+                stats[f"right_kv_gates_contrib/layer_{target_idx + 1}_from_{source_idx + 1}"] = float(
+                    contrib_abs[target_idx, source_idx].item()
+                )
+
+        return stats
+
+
 def _short_text(text, limit=245):
     text = text.replace("\n", " ").strip()
     if len(text) <= limit:
@@ -1536,6 +1593,10 @@ def train(train_cfg, vlm_cfg, model_mode: str = "nanovlm"):
                 stats.update(lr_stats)
                 if grad_norm_value is not None:
                     stats["grad_norm"] = grad_norm_value
+                right_kv_gate_stats = {}
+                if is_master():
+                    right_kv_gate_stats = _collect_right_kv_gate_stats(model)
+                    stats.update(right_kv_gate_stats)
 
                 # MASTER ONLY: Log to wandb
                 if train_cfg.log_wandb and is_master():
@@ -1569,6 +1630,9 @@ def train(train_cfg, vlm_cfg, model_mode: str = "nanovlm"):
                         f"lr_right={stats.get('lr_right_tower', 0.0):.6g} "
                         f"lr_bridge={stats.get('lr_kv_bridge', 0.0):.6g} "
                         f"lr_right_kv_gates={stats.get('lr_right_kv_gates', 0.0):.6g} "
+                        f"gate_drift_fro={stats.get('right_kv_gates/drift_fro', 0.0):.4f} "
+                        f"gate_diag_mean={stats.get('right_kv_gates/diag_mean', 0.0):.4f} "
+                        f"gate_offdiag_abs_mean={stats.get('right_kv_gates/offdiag_abs_mean', 0.0):.4f} "
                         + (f"grad_norm={stats['grad_norm']:.4f}" if 'grad_norm' in stats else "")
                     )
                 
